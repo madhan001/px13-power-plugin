@@ -1,0 +1,5 @@
+#!/bin/sh
+# systemd-sleep hook: firmware resets RyzenAdj limits across suspend.
+case "$1" in
+  post) systemctl start --no-block px13-reapply.service ;;
+esac

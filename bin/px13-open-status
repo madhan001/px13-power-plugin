@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+status_command='/usr/local/bin/px13 status'
+hold_command='echo; read -r -p "Press Enter to close..."'
+
+if command -v konsole >/dev/null 2>&1; then
+  exec konsole --title "PX13 Status" -e bash -c "${status_command}; ${hold_command}"
+fi
+
+if command -v kdialog >/dev/null 2>&1; then
+  tmp="$(mktemp)"
+  trap 'rm -f "${tmp}"' EXIT
+  ${status_command} > "${tmp}" 2>&1 || true
+  kdialog --title "PX13 Status" --textbox "${tmp}" 900 700
+  exit 0
+fi
+
+if command -v xterm >/dev/null 2>&1; then
+  exec xterm -T "PX13 Status" -e bash -c "${status_command}; ${hold_command}"
+fi
+
+exec bash -c "${status_command}; ${hold_command}"

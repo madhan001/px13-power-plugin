@@ -1,0 +1,230 @@
+From: YOUR NAME <you@example.com>
+Subject: [PATCH RFC] platform/x86: asus-wmi: support the Vivo/ProArt dGPU disable device
+
+Some ASUS Vivobook, Zenbook and ProArt laptops implement dGPU disable
+("GPU Eco") on WMI device 0x00090120 instead of 0x00090020. On these
+machines the DSTS/DEVS semantics are the same (1 = dGPU powered off),
+but because 0x00090020 is absent, neither asus-wmi nor asus-armoury
+exposes dgpu_disable today. Userspace tools (G-Helper on Windows) already
+use 0x00090120 for these models as GPUEcoVivo.
+
+Add ASUS_WMI_DEVID_DGPU_VIVO and fall back to it when ASUS_WMI_DEVID_DGPU
+is not present, mirroring how GPU_MUX_VIVO is handled. In asus-armoury,
+dgpu_disable can no longer be registered from the static table keyed on a
+fixed ID, so it is created alongside gpu_mux_mode with its own cleanup.
+
+Tested on a ProArt PX13 (HN7306WU, BIOS 318), kernel 7.0:
+- DEVS(0x00090120, 1): the firmware (SUMA) sends an eject request for
+  the dGPU and waits up to ~20 s for its _EJ0 to run. With ACPI PCI
+  hotplug the kernel services the eject itself: the call returns 1 in
+  ~0.2 s and DSTS reads 0x10001. Userspace must therefore not remove the
+  PCI device first; per the ACPI code, _EJ0 would then never run and the
+  method would time out with the dGPU still powered (not tested).
+- DEVS(0x00090120, 0): the firmware powers the dGPU (FGON), issues a
+  Device Check and waits up to ~20 s for the PCIe link. On Linux the
+  Device Check alone does not enumerate the device; the link only comes
+  up on a rescan of the root port. Without a rescan the method times out
+  after ~20 s and returns 2, although DSTS reads 0x10000 (enabled). With
+  a rescan issued ~1 s into the call, it returns 1 after ~1.1 s and the
+  dGPU is enumerated and bound to its driver after ~1.7 s. The store
+  blocks in the ACPI method and cannot rescan during the wait, so when
+  the result is 2 asus-wmi trusts the DSTS readback and logs a hint to
+  rescan.
+
+RFC because:
+- the return-value-2 handling is based on one machine;
+- ideally the dGPU would be enumerated on the firmware's Device Check,
+  or asus-wmi would rescan the parent port itself, so userspace does not
+  have to; feedback welcome on which layer should own that.
+
+Signed-off-by: YOUR NAME <you@example.com>
+---
+diff --git a/drivers/platform/x86/asus-armoury.c b/drivers/platform/x86/asus-armoury.c
+--- a/drivers/platform/x86/asus-armoury.c	2026-09-29 22:44:17.890291085 -0400
++++ b/drivers/platform/x86/asus-armoury.c	2026-09-29 22:48:44.877868680 -0400
+@@ -93,6 +93,7 @@
+ 
+ 	u32 mini_led_dev_id;
+ 	u32 gpu_mux_dev_id;
++	u32 dgpu_dev_id;
+ };
+ 
+ static struct asus_armoury_priv asus_armoury = {
+@@ -444,8 +445,8 @@
+ 	if (err)
+ 		return err;
+ 
+-	if (armoury_has_devstate(ASUS_WMI_DEVID_DGPU)) {
+-		err = armoury_get_devstate(NULL, &result, ASUS_WMI_DEVID_DGPU);
++	if (asus_armoury.dgpu_dev_id) {
++		err = armoury_get_devstate(NULL, &result, asus_armoury.dgpu_dev_id);
+ 		if (err)
+ 			return err;
+ 		if (result && !optimus) {
+@@ -499,7 +500,7 @@
+ 	}
+ 
+ 	scoped_guard(mutex, &asus_armoury.egpu_mutex) {
+-		err = armoury_set_devstate(attr, disable ? 1 : 0, NULL, ASUS_WMI_DEVID_DGPU);
++		err = armoury_set_devstate(attr, disable ? 1 : 0, NULL, asus_armoury.dgpu_dev_id);
+ 		if (err)
+ 			return err;
+ 	}
+@@ -508,7 +509,12 @@
+ 
+ 	return count;
+ }
+-ASUS_WMI_SHOW_INT(dgpu_disable_current_value, ASUS_WMI_DEVID_DGPU);
++
++static ssize_t dgpu_disable_current_value_show(struct kobject *kobj,
++					       struct kobj_attribute *attr, char *buf)
++{
++	return armoury_attr_uint_show(kobj, attr, buf, asus_armoury.dgpu_dev_id);
++}
+ ASUS_ATTR_GROUP_BOOL(dgpu_disable, "dgpu_disable", "Disable the dGPU");
+ 
+ /* Values map for eGPU activation requests. */
+@@ -782,7 +788,6 @@
+ static const struct asus_attr_group armoury_attr_groups[] = {
+ 	{ &egpu_connected_attr_group, ASUS_WMI_DEVID_EGPU_CONNECTED },
+ 	{ &egpu_enable_attr_group, ASUS_WMI_DEVID_EGPU },
+-	{ &dgpu_disable_attr_group, ASUS_WMI_DEVID_DGPU },
+ 	{ &apu_mem_attr_group, ASUS_WMI_DEVID_APU_MEM },
+ 
+ 	{ &ppt_pl1_spl_attr_group, ASUS_WMI_DEVID_PPT_PL1_SPL },
+@@ -926,6 +931,21 @@
+ 		}
+ 	}
+ 
++	asus_armoury.dgpu_dev_id = 0;
++	if (armoury_has_devstate(ASUS_WMI_DEVID_DGPU))
++		asus_armoury.dgpu_dev_id = ASUS_WMI_DEVID_DGPU;
++	else if (armoury_has_devstate(ASUS_WMI_DEVID_DGPU_VIVO))
++		asus_armoury.dgpu_dev_id = ASUS_WMI_DEVID_DGPU_VIVO;
++
++	if (asus_armoury.dgpu_dev_id) {
++		err = sysfs_create_group(&asus_armoury.fw_attr_kset->kobj,
++					 &dgpu_disable_attr_group);
++		if (err) {
++			pr_err("Failed to create sysfs-group for dgpu_disable\n");
++			goto err_remove_gpu_mux_group;
++		}
++	}
++
+ 	for (i = 0; i < ARRAY_SIZE(armoury_attr_groups); i++) {
+ 		if (!armoury_has_devstate(armoury_attr_groups[i].wmi_devid))
+ 			continue;
+@@ -963,6 +983,9 @@
+ 			sysfs_remove_group(&asus_armoury.fw_attr_kset->kobj,
+ 					   armoury_attr_groups[i].attr_group);
+ 	}
++	if (asus_armoury.dgpu_dev_id)
++		sysfs_remove_group(&asus_armoury.fw_attr_kset->kobj, &dgpu_disable_attr_group);
++err_remove_gpu_mux_group:
+ 	if (asus_armoury.gpu_mux_dev_id)
+ 		sysfs_remove_group(&asus_armoury.fw_attr_kset->kobj, &gpu_mux_mode_attr_group);
+ err_remove_mini_led_group:
+@@ -1135,6 +1158,9 @@
+ 					   armoury_attr_groups[i].attr_group);
+ 	}
+ 
++	if (asus_armoury.dgpu_dev_id)
++		sysfs_remove_group(&asus_armoury.fw_attr_kset->kobj, &dgpu_disable_attr_group);
++
+ 	if (asus_armoury.gpu_mux_dev_id)
+ 		sysfs_remove_group(&asus_armoury.fw_attr_kset->kobj, &gpu_mux_mode_attr_group);
+ 
+diff --git a/drivers/platform/x86/asus-wmi.c b/drivers/platform/x86/asus-wmi.c
+--- a/drivers/platform/x86/asus-wmi.c	2026-09-29 22:44:17.506288630 -0400
++++ b/drivers/platform/x86/asus-wmi.c	2026-09-29 22:46:27.459399480 -0400
+@@ -293,7 +293,7 @@
+ 	u8 fan_boost_mode;
+ 
+ 	bool egpu_enable_available;
+-	bool dgpu_disable_available;
++	u32 dgpu_dev;
+ 	u32 gpu_mux_dev;
+ 
+ 	/* Tunables provided by ASUS for gaming laptops */
+@@ -768,7 +768,7 @@
+ 	struct asus_wmi *asus = dev_get_drvdata(dev);
+ 	int result;
+ 
+-	result = asus_wmi_get_devstate_simple(asus, ASUS_WMI_DEVID_DGPU);
++	result = asus_wmi_get_devstate_simple(asus, asus->dgpu_dev);
+ 	if (result < 0)
+ 		return result;
+ 
+@@ -811,15 +811,25 @@
+ 		}
+ 	}
+ 
+-	err = asus_wmi_set_devstate(ASUS_WMI_DEVID_DGPU, disable, &result);
++	err = asus_wmi_set_devstate(asus->dgpu_dev, disable, &result);
+ 	if (err) {
+ 		pr_warn("Failed to set dgpu disable: %d\n", err);
+ 		return err;
+ 	}
+ 
++	/*
++	 * On some DGPU_VIVO firmware (e.g. ProArt PX13) re-enabling returns 2
++	 * after the ACPI method times out waiting for the PCIe link, although
++	 * the dGPU has been powered. The link comes up on a PCI rescan of the
++	 * root port, so trust the state readback over the return code.
++	 */
+ 	if (result > 1) {
+-		pr_warn("Failed to set dgpu disable (result): 0x%x\n", result);
+-		return -EIO;
++		if (asus_wmi_get_devstate_simple(asus, asus->dgpu_dev) != disable) {
++			pr_warn("Failed to set dgpu disable (result): 0x%x\n", result);
++			return -EIO;
++		}
++		if (!disable)
++			pr_info("dGPU powered on; rescan the PCI bus to enumerate it\n");
+ 	}
+ 
+ 	sysfs_notify(&asus->platform_device->dev.kobj, NULL, "dgpu_disable");
+@@ -953,8 +963,8 @@
+ 	if (optimus > 1)
+ 		return -EINVAL;
+ 
+-	if (asus->dgpu_disable_available) {
+-		result = asus_wmi_get_devstate_simple(asus, ASUS_WMI_DEVID_DGPU);
++	if (asus->dgpu_dev) {
++		result = asus_wmi_get_devstate_simple(asus, asus->dgpu_dev);
+ 		if (result < 0)
+ 			/* An error here may signal greater failure of GPU handling */
+ 			return result;
+@@ -4759,7 +4769,7 @@
+ 	else if (attr == &dev_attr_egpu_connected.attr)
+ 		devid = ASUS_WMI_DEVID_EGPU_CONNECTED;
+ 	else if (attr == &dev_attr_dgpu_disable.attr)
+-		ok = asus->dgpu_disable_available;
++		ok = asus->dgpu_dev != 0;
+ 	else if (attr == &dev_attr_gpu_mux_mode.attr)
+ 		ok = asus->gpu_mux_dev != 0;
+ 	else if (attr == &dev_attr_fan_boost_mode.attr)
+@@ -5056,7 +5066,10 @@
+ 	asus->nv_temp_target = 75;
+ 
+ 	asus->egpu_enable_available = asus_wmi_dev_is_present(asus, ASUS_WMI_DEVID_EGPU);
+-	asus->dgpu_disable_available = asus_wmi_dev_is_present(asus, ASUS_WMI_DEVID_DGPU);
++	if (asus_wmi_dev_is_present(asus, ASUS_WMI_DEVID_DGPU))
++		asus->dgpu_dev = ASUS_WMI_DEVID_DGPU;
++	else if (asus_wmi_dev_is_present(asus, ASUS_WMI_DEVID_DGPU_VIVO))
++		asus->dgpu_dev = ASUS_WMI_DEVID_DGPU_VIVO;
+ 	asus->kbd_rgb_state_available = asus_wmi_dev_is_present(asus, ASUS_WMI_DEVID_TUF_RGB_STATE);
+ 
+ 	if (asus_wmi_dev_is_present(asus, ASUS_WMI_DEVID_MINI_LED_MODE))
+diff --git a/include/linux/platform_data/x86/asus-wmi.h b/include/linux/platform_data/x86/asus-wmi.h
+--- a/include/linux/platform_data/x86/asus-wmi.h	2026-09-29 22:44:18.654295968 -0400
++++ b/include/linux/platform_data/x86/asus-wmi.h	2026-09-29 22:46:27.458119230 -0400
+@@ -146,6 +146,8 @@
+ /* gpu mux switch, 0 = dGPU, 1 = Optimus */
+ #define ASUS_WMI_DEVID_GPU_MUX		0x00090016
+ #define ASUS_WMI_DEVID_GPU_MUX_VIVO	0x00090026
++/* dGPU disable on Vivobook/Zenbook/ProArt ("GPU Eco"), same semantics as DGPU */
++#define ASUS_WMI_DEVID_DGPU_VIVO	0x00090120
+ 
+ /* TUF laptop RGB modes/colours */
+ #define ASUS_WMI_DEVID_TUF_RGB_MODE	0x00100056

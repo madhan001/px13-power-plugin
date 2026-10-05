@@ -1,0 +1,17 @@
+[Unit]
+Description=PX13 power mode watcher (re-applies limits the firmware overrides)
+After=power-profiles-daemon.service sys-kernel-debug.mount
+Wants=power-profiles-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/px13 watch
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+# power-profiles-daemon starts after multi-user.target on Kubuntu, so being
+# wanted by multi-user.target while ordered after it is a cycle (systemd drops
+# this unit at boot). graphical.target is where power-profiles-daemon lives.
+WantedBy=graphical.target

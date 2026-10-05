@@ -1,0 +1,15 @@
+# PX13 presence agent settings (applied live; px13-presence-ctl set KEY VALUE).
+[presence]
+# Master switch for the agent's actions (the sensor goes to standby when off).
+enabled = true
+# Lock the session after being away this many seconds (10..3600).
+lock = true
+lock_after = 60
+# Dim the built-in screen after looking away this many seconds (3..600),
+# to dim_level percent of maximum brightness (5..90); restored when you look back.
+dim = true
+dim_after = 10
+dim_level = 30
+# Keep the sensor on while locked and wake the screen when you return.
+# Off by default: costs a little power while the session is locked.
+wake_on_return = false

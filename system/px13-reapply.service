@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-apply PX13 power mode after resume
+After=power-profiles-daemon.service sys-kernel-debug.mount
+
+[Service]
+Type=oneshot
+# Give the firmware time to finish its own post-resume/AC limit changes.
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/px13 reapply

@@ -1,0 +1,4 @@
+# px13 re-runs itself through this rule and validates its own arguments.
+# Everything it needs as root (RyzenAdj, WMI debugfs, EnvyControl helper,
+# sysfs writes) happens inside px13, so no other command is allowed here.
+madhan ALL=(root) NOPASSWD: /usr/local/bin/px13

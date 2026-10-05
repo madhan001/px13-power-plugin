@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Runs EnvyControl as root for px13. Only a root-owned install is accepted:
+# the old per-user pipx copy under ~/.local was writable by the user, which
+# made this sudo rule a passwordless route to root.
+set -euo pipefail
+
+ENVYCONTROL_DIR="/opt/envycontrol"
+ENVYCONTROL="${ENVYCONTROL_DIR}/bin/envycontrol"
+
+usage() {
+  echo "Usage: px13-envycontrol {integrated|hybrid-rtd3|query}" >&2
+  exit 2
+}
+
+[[ "$#" -eq 1 ]] || usage
+
+if [[ ! -x "${ENVYCONTROL}" ]]; then
+  echo "EnvyControl is not installed at ${ENVYCONTROL}." >&2
+  exit 1
+fi
+
+# Refuse if anything in the install is not root-owned or is writable by
+# group/other (symlinks excluded: their mode bits are meaningless).
+if [[ -n "$(find "${ENVYCONTROL_DIR}" \( ! -user root -o -perm -g+w -o -perm -o+w \) ! -type l -print -quit)" ]]; then
+  echo "Refusing to run: ${ENVYCONTROL_DIR} is not exclusively root-writable." >&2
+  exit 1
+fi
+
+case "$1" in
+  integrated) exec "${ENVYCONTROL}" -s integrated ;;
+  hybrid-rtd3) exec "${ENVYCONTROL}" -s hybrid --rtd3 ;;
+  query) exec "${ENVYCONTROL}" -q ;;
+  *) usage ;;
+esac

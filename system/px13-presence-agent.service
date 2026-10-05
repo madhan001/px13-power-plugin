@@ -1,0 +1,14 @@
+[Unit]
+Description=PX13 presence agent (adaptive lock / dimming from the webcam presence sensor)
+PartOf=graphical-session.target
+After=plasma-workspace.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/px13-presence-agent
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

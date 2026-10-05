@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [{ "Name": "Madhan" }],
+        "Category": "System Information",
+        "Description": "Live view and settings for the PX13 webcam presence sensor",
+        "EnabledByDefault": false,
+        "Icon": "user-available-symbolic",
+        "Id": "org.madhan.px13presence",
+        "License": "MIT",
+        "Name": "PX13 Presence",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

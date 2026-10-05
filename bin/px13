@@ -1,0 +1,920 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="/usr/local/bin/px13"
+STATE_DIR="/var/lib/px13"
+MODE_FILE="${STATE_DIR}/mode"
+RUN_DIR="/run/px13"
+LIVE_FILE="${RUN_DIR}/state"
+LOCK_FILE="${RUN_DIR}/lock"
+RYZENADJ="/usr/local/bin/ryzenadj"
+ENVYCONTROL_HELPER="/usr/local/bin/px13-envycontrol"
+ENVYCONTROL="/opt/envycontrol/bin/envycontrol"
+PLATFORM_PROFILE="/sys/firmware/acpi/platform_profile"
+NVIDIA_BLACKLIST="/etc/modprobe.d/blacklist-nvidia.conf"
+CO_NEG25="0xFFFE7"
+WATCH_INTERVAL=60
+AC_ONLINE="/sys/class/power_supply/AC0/online"
+
+# ASUS WMI via the asus-nb-wmi debugfs interface. The EC applies these power
+# limits itself (WMI 0x001200A3/A0/C1 -> EC cmds 0x29/0x28/0x2D, 1 byte, W),
+# so the EC's own staged mode changes no longer overwrite them.
+WMI_DEBUGFS="/sys/kernel/debug/asus-nb-wmi"
+WMI_PL1_SPL=0x001200A3
+WMI_PL2_SPPT=0x001200A0
+WMI_PL3_FPPT=0x001200C1
+# Measured EC ceilings (STAPM slow fast, W); requests above are clamped.
+EC_CEILING_AC="65 70 85"
+EC_CEILING_DC="56 65 85"
+# The EC accepts anything down to 5 W; refuse values that low ourselves.
+EC_MIN_W=8
+EC_MAX_W=120
+
+# Firmware GPU Eco (ProArt/Vivo ID; the ROG 0x00090020 is not implemented).
+# 1 = EC cmd 0x45, firmware asks the OS to eject the dGPU, sets UMAF in CMOS.
+# 0 = firmware powers the dGPU back on; Linux must rescan the bridge.
+WMI_GPU_ECO=0x00090120
+NVIDIA_BRIDGE="/sys/bus/pci/devices/0000:00:03.1"
+# EnvyControl's integrated-mode rule deletes the dGPU from PCI as soon as it
+# appears, which would break both the rescan and the firmware eject.
+ENVY_REMOVE_RULE="/etc/udev/rules.d/50-remove-nvidia.rules"
+
+# GPU policy: manual (Eco/Hybrid as clicked) or optimized (like Windows:
+# Eco on battery, Hybrid on AC). Optimized acts only once AC has been stable
+# for OPTIMIZED_SETTLE seconds, so quick plug/unplug does not flap the GPU.
+GPU_POLICY_FILE="${STATE_DIR}/gpu_policy"
+AC_SINCE_FILE="${RUN_DIR}/ac_since"
+GPU_BUSY_FILE="${RUN_DIR}/gpu_busy"
+OPTIMIZED_SETTLE=10
+
+# mode -> "power-profile stapm_mW slow_mW fast_mW"
+declare -A MODES=(
+  [eco]="power-saver 15000 15000 20000"
+  [normal]="balanced 25000 25000 35000"
+  [perf]="performance 70000 70000 80000"
+)
+
+usage() {
+  cat <<'EOF'
+Usage: px13 {eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|presence|reapply|check|watch|state}
+
+  eco       power-saver, 15W/15W/20W, CO -25, NVIDIA PCI runtime auto
+  normal    balanced, 25W/25W/35W, CO -25, NVIDIA PCI runtime auto
+  perf      performance, 70W/70W/80W request (EC caps at 65/70/85 on AC, 56/65/85 on battery), CO -25
+  cycle     eco -> normal -> perf -> eco
+            (changing the power profile elsewhere, e.g. KDE or Fn+F5, switches mode too)
+  status    full report: mode, live limits, battery, GPU, RyzenAdj
+  deep-eco  firmware GPU Eco on: NVIDIA GPU powered off, live (no reboot)
+  hybrid    firmware GPU Eco off: NVIDIA GPU back on the bus (first switch from
+            EnvyControl integrated rebuilds the driver config, ~3 min)
+  optimized GPU follows power: Eco on battery, Hybrid on AC (deep-eco or
+            hybrid switch back to manual)
+  presence  on|off|active|standby|status - webcam presence sensor service
+            (on/off: enable/disable it; active/standby: sensor streaming/off)
+  reapply   re-apply the stored mode (used after boot, resume and AC changes)
+  check     re-apply the stored mode only if firmware has overridden the limits
+  watch     follow profile/AC changes, check every 60s, publish state (px13-watch.service)
+  state     print live state as key=value (for the panel widget)
+EOF
+}
+
+log() {
+  # Goes to the journal when run from systemd, and to the terminal otherwise.
+  echo "$*"
+}
+
+notify() {
+  [[ -n "${PX13_NO_NOTIFY:-}" ]] && return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a "PX13 Power" -i preferences-system-power-management "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------- stored mode
+
+valid_mode() {
+  [[ -n "${1:-}" && -n "${MODES[$1]:-}" ]]
+}
+
+profile_mode() {
+  case "$1" in
+    power-saver) echo eco ;;
+    balanced) echo normal ;;
+    performance) echo perf ;;
+    *) echo unknown ;;
+  esac
+}
+
+mode_profile() {
+  if valid_mode "$1"; then
+    echo "${MODES[$1]%% *}"
+  else
+    echo unknown
+  fi
+}
+
+# Uses only builtins: the watcher calls this every couple of seconds.
+stored_mode() {
+  local mode=""
+  if [[ -r "${MODE_FILE}" ]]; then
+    read -r mode < "${MODE_FILE}" || true
+  fi
+  if valid_mode "${mode}"; then
+    printf '%s\n' "${mode}"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+write_mode() {
+  install -d -m 755 "${STATE_DIR}"
+  printf '%s\n' "$1" > "${MODE_FILE}.tmp"
+  chmod 644 "${MODE_FILE}.tmp"
+  mv -f "${MODE_FILE}.tmp" "${MODE_FILE}"
+}
+
+# ------------------------------------------------------------- live readings
+
+current_profile() {
+  local p=""
+  read -r p 2>/dev/null < "${PLATFORM_PROFILE}" || true
+  case "${p}" in
+    quiet|low-power) echo power-saver ;;
+    balanced) echo balanced ;;
+    performance) echo performance ;;
+    *) echo unknown ;;
+  esac
+}
+
+# Prints "stapm slow fast" in watts, or nothing if RyzenAdj cannot read them.
+read_limits() {
+  "${RYZENADJ}" -i 2>/dev/null | awk -F'|' '
+    /STAPM LIMIT/    { gsub(/ /, "", $3); s = $3 }
+    /PPT LIMIT SLOW/ { gsub(/ /, "", $3); l = $3 }
+    /PPT LIMIT FAST/ { gsub(/ /, "", $3); f = $3 }
+    END { if (s != "" && l != "" && f != "") printf "%s %s %s\n", s, l, f }'
+}
+
+# limits_match "<stapm slow fast in W>" <mode>
+# Firmware may clamp a request downward (perf STAPM 70 -> 65), so accept
+# anything between 85% and 100% of each requested value. In perf, firmware
+# also trims further on battery (to 56/65/80 W) a few seconds later; accept
+# down to 75% so the watcher doesn't fight that every 20s.
+on_ac() {
+  local ac=0
+  read -r ac 2>/dev/null < "${AC_ONLINE}" || true
+  [[ "${ac}" == 1 ]]
+}
+
+# Prints the "stapm slow fast" watts the EC will actually give for a mode:
+# the request clamped to the ceiling for the current power source.
+expected_limits() {
+  local _profile stapm slow fast ceiling
+  read -r _profile stapm slow fast <<< "${MODES[$1]}"
+  if on_ac; then ceiling="${EC_CEILING_AC}"; else ceiling="${EC_CEILING_DC}"; fi
+  awk -v r="${stapm} ${slow} ${fast}" -v c="${ceiling}" 'BEGIN {
+    split(r, rv, " "); split(c, cv, " ")
+    for (i = 1; i <= 3; i++) {
+      w = rv[i] / 1000
+      printf "%d%s", (w < cv[i] ? w : cv[i]), (i < 3 ? " " : "\n")
+    }
+  }'
+}
+
+# limits_match "<stapm slow fast in W>" <mode>
+# Accept anything between the clamped expectation (minus 1 W) and the raw
+# request (plus 0.5 W), so the RyzenAdj fallback also verifies.
+limits_match() {
+  local actual="$1" mode="$2" _profile stapm slow fast
+  read -r _profile stapm slow fast <<< "${MODES[$mode]}"
+  [[ -n "${actual}" ]] || return 1
+  awk -v a="${actual}" -v r="${stapm} ${slow} ${fast}" -v e="$(expected_limits "${mode}")" 'BEGIN {
+    n = split(a, av, " "); split(r, rv, " "); split(e, ev, " ")
+    if (n != 3) exit 1
+    for (i = 1; i <= 3; i++) {
+      if (av[i] > rv[i] / 1000 + 0.5 || av[i] < ev[i] - 1) exit 1
+    }
+  }'
+}
+
+nvidia_devices() {
+  local dev
+  for dev in /sys/bus/pci/devices/*; do
+    [[ "$(cat "${dev}/vendor" 2>/dev/null)" == "0x10de" ]] || continue
+    # Only the display/3D controller functions (class 0x03xxxx).
+    [[ "$(cat "${dev}/class" 2>/dev/null)" == 0x03* ]] || continue
+    basename "${dev}"
+  done
+}
+
+# All PCI functions of the dGPU (display, HDMI audio, ...).
+nvidia_functions() {
+  local dev
+  for dev in /sys/bus/pci/devices/*; do
+    [[ "$(cat "${dev}/vendor" 2>/dev/null)" == "0x10de" ]] && basename "${dev}"
+  done
+}
+
+gpu_driver() {
+  local dev drv
+  for dev in $(nvidia_devices); do
+    drv="$(readlink "/sys/bus/pci/devices/${dev}/driver" 2>/dev/null || true)"
+    [[ -n "${drv}" ]] && { basename "${drv}"; return 0; }
+  done
+  echo none
+}
+
+# Why a powered GPU has no driver: none | no_module | blacklisted | not_loaded
+gpu_driver_issue() {
+  if [[ "$(gpu_driver)" != none || -z "$(nvidia_devices)" ]]; then
+    echo none
+  elif ! modinfo -k "$(uname -r)" -n nvidia >/dev/null 2>&1; then
+    echo no_module
+  elif [[ -e "${NVIDIA_BLACKLIST}" ]]; then
+    echo blacklisted
+  else
+    echo not_loaded
+  fi
+}
+
+gpu_eco_state() {
+  if ! ec_available; then
+    echo unknown
+    return 0
+  fi
+  case "$(wmi_dsts "${WMI_GPU_ECO}")" in
+    0x10001) echo on ;;
+    0x10000) echo off ;;
+    *) echo unknown ;;
+  esac
+}
+
+gpu_config() {
+  if [[ -e "${NVIDIA_BLACKLIST}" ]]; then echo integrated; else echo hybrid; fi
+}
+
+# Writes the live state file the widget reads; must run as root.
+publish_state() {
+  local mode limits applied gpu_cfg gpu_present="no" pending="no" eco drv issue
+  mode="$(stored_mode)"
+  limits="$(read_limits || true)"
+  if [[ "${mode}" == unknown ]]; then
+    applied="unknown"
+  elif limits_match "${limits}" "${mode}"; then
+    applied="yes"
+  else
+    applied="drifted"
+  fi
+  gpu_cfg="$(gpu_config)"
+  [[ -n "$(nvidia_devices)" ]] && gpu_present="yes"
+  eco="$(gpu_eco_state)"
+  drv="$(gpu_driver)"
+  # Only a blacklisted driver (EnvyControl config not yet booted) is fixed by
+  # a reboot; a missing module for the running kernel is not.
+  issue="$(gpu_driver_issue)"
+  if [[ "${eco}" == off && "${issue}" == blacklisted ]]; then
+    pending="yes"
+  fi
+
+  install -d -m 755 "${RUN_DIR}"
+  local tmp
+  # Unique temp file: `px13 state` and the watcher can publish at once.
+  tmp="$(mktemp "${RUN_DIR}/state.XXXXXX")"
+  {
+    printf 'mode=%s\n' "${mode}"
+    printf 'profile=%s\n' "$(current_profile)"
+    printf 'expected_profile=%s\n' "$(mode_profile "${mode}")"
+    printf 'limits=%s\n' "${limits:-unknown}"
+    printf 'applied=%s\n' "${applied}"
+    printf 'limit_path=%s\n' "$(ec_available && echo ec || echo ryzenadj)"
+    printf 'gpu_config=%s\n' "${gpu_cfg}"
+    printf 'gpu_present=%s\n' "${gpu_present}"
+    printf 'gpu_eco=%s\n' "${eco}"
+    printf 'gpu_driver=%s\n' "${drv}"
+    printf 'gpu_driver_issue=%s\n' "${issue}"
+    printf 'gpu_policy=%s\n' "$(gpu_policy)"
+    printf 'gpu_busy=%s\n' "$(cat "${GPU_BUSY_FILE}" 2>/dev/null || true)"
+    printf 'reboot_pending=%s\n' "${pending}"
+    printf 'updated=%s\n' "$(date +%s)"
+  } > "${tmp}"
+  chmod 644 "${tmp}"
+  mv -f "${tmp}" "${LIVE_FILE}"
+}
+
+# ------------------------------------------------------------------- applying
+
+set_nvidia_auto() {
+  local dev
+  for dev in $(nvidia_devices); do
+    printf 'auto\n' > "/sys/bus/pci/devices/${dev}/power/control" 2>/dev/null || true
+  done
+}
+
+ec_available() {
+  [[ -w "${WMI_DEBUGFS}/dev_id" && -w "${WMI_DEBUGFS}/ctrl_param" && -r "${WMI_DEBUGFS}/devs" ]]
+}
+
+# debugfs has one shared dev_id/ctrl_param pair, so every call takes this
+# lock: an unlocked status read racing a limit write could send a watt value
+# to the GPU Eco switch. GPU Eco off holds it ~1s (up to ~20s if the link
+# never comes up).
+wmi_locked() {
+  (
+    flock -w 40 7 || { echo "WMI lock timeout" >&2; exit 1; }
+    "$@"
+  ) 7> "${RUN_DIR}/wmi.lock"
+}
+
+_wmi_devs() {
+  local out
+  printf '%s\n' "$1" > "${WMI_DEBUGFS}/dev_id"
+  printf '%s\n' "$2" > "${WMI_DEBUGFS}/ctrl_param"
+  out="$(cat "${WMI_DEBUGFS}/devs")"
+  printf '%s\n' "${out##*= }"
+}
+
+_wmi_dsts() {
+  local out
+  printf '%s\n' "$1" > "${WMI_DEBUGFS}/dev_id"
+  out="$(cat "${WMI_DEBUGFS}/dsts" 2>/dev/null || true)"
+  printf '%s\n' "${out##*= }"
+}
+
+# wmi_devs <dev_id> <value>: prints the WMI return value (e.g. 0x1).
+wmi_devs() {
+  install -d -m 755 "${RUN_DIR}"
+  wmi_locked _wmi_devs "$@"
+}
+
+# wmi_dsts <dev_id>: prints the raw status (e.g. 0x10001).
+wmi_dsts() {
+  install -d -m 755 "${RUN_DIR}"
+  wmi_locked _wmi_dsts "$@"
+}
+
+# ec_set_limits <stapm_mW> <slow_mW> <fast_mW>
+ec_set_limits() {
+  local ids=("${WMI_PL1_SPL}" "${WMI_PL2_SPPT}" "${WMI_PL3_FPPT}") vals i w rc
+  vals=("$(( $1 / 1000 ))" "$(( $2 / 1000 ))" "$(( $3 / 1000 ))")
+  for i in 0 1 2; do
+    w="${vals[$i]}"
+    if ((w < EC_MIN_W || w > EC_MAX_W)); then
+      echo "Refusing EC power limit ${w} W (allowed ${EC_MIN_W}-${EC_MAX_W} W)." >&2
+      return 1
+    fi
+  done
+  for i in 0 1 2; do
+    rc="$(wmi_devs "${ids[$i]}" "${vals[$i]}")"
+    if [[ "${rc}" != 0x1 ]]; then
+      echo "EC rejected ${ids[$i]}=${vals[$i]} (returned ${rc})." >&2
+      return 1
+    fi
+  done
+}
+
+# Poll for up to 3s until the limits match the mode.
+wait_for_limits() {
+  local mode="$1" i
+  for ((i = 0; i < 6; i++)); do
+    sleep 0.5
+    limits_match "$(read_limits || true)" "${mode}" && return 0
+  done
+  return 1
+}
+
+run_ryzenadj_limits() {
+  local stapm="$1" slow="$2" fast="$3"
+  "${RYZENADJ}" \
+    --stapm-limit="${stapm}" \
+    --slow-limit="${slow}" \
+    --fast-limit="${fast}" \
+    --set-coall="${CO_NEG25}" >/dev/null 2>&1
+}
+
+# Changing the platform profile makes the firmware write its own power limits
+# roughly a second later, overwriting anything RyzenAdj set before that.
+# Wait until the limits move away from what they were, or 3s at most.
+wait_for_firmware() {
+  local before="$1" i now
+  for ((i = 0; i < 12; i++)); do
+    sleep 0.25
+    now="$(read_limits || true)"
+    if [[ -n "${now}" && "${now}" != "${before}" ]]; then
+      sleep 0.3
+      return 0
+    fi
+  done
+}
+
+# apply_mode <mode>; returns 0 if the limits verified.
+apply_mode() {
+  local mode="$1" profile stapm slow fast attempt
+  read -r profile stapm slow fast <<< "${MODES[$mode]}"
+
+  if [[ ! -x "${RYZENADJ}" ]]; then
+    echo "RyzenAdj not found at ${RYZENADJ}." >&2
+    return 1
+  fi
+
+  if ec_available; then
+    apply_mode_ec "${mode}" && return 0
+    echo "EC path did not verify; falling back to RyzenAdj." >&2
+  fi
+  apply_mode_ryzenadj "${mode}"
+}
+
+# The EC reloads its own per-mode limits on a profile change and ignores a
+# write sent in the same instant; one sent 0.3s later sticks through the EC's
+# delayed ramp stages. RyzenAdj is used only to read back and for CO.
+apply_mode_ec() {
+  local mode="$1" profile stapm slow fast attempt
+  read -r profile stapm slow fast <<< "${MODES[$mode]}"
+
+  if [[ "$(current_profile)" != "${profile}" ]]; then
+    if ! powerprofilesctl set "${profile}" >/dev/null 2>&1; then
+      echo "Could not set power profile '${profile}'; continuing." >&2
+    fi
+    sleep 0.3
+  fi
+
+  for attempt in 1 2; do
+    ec_set_limits "${stapm}" "${slow}" "${fast}" || return 1
+    if wait_for_limits "${mode}"; then
+      "${RYZENADJ}" --set-coall="${CO_NEG25}" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_mode_ryzenadj() {
+  local mode="$1" profile stapm slow fast before attempt limits
+  read -r profile stapm slow fast <<< "${MODES[$mode]}"
+
+  if [[ "$(current_profile)" != "${profile}" ]]; then
+    before="$(read_limits || true)"
+    if powerprofilesctl set "${profile}" >/dev/null 2>&1; then
+      wait_for_firmware "${before}"
+    else
+      echo "Could not set power profile '${profile}'; continuing." >&2
+    fi
+  fi
+
+  for attempt in 1 2 3; do
+    run_ryzenadj_limits "${stapm}" "${slow}" "${fast}" || true
+    sleep 0.3
+    limits="$(read_limits || true)"
+    if limits_match "${limits}" "${mode}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Limits did not stick after 3 attempts (reading: ${limits:-none} W)." >&2
+  return 1
+}
+
+with_lock() {
+  install -d -m 755 "${RUN_DIR}"
+  exec 9> "${LOCK_FILE}"
+  if ! flock -w 30 9; then
+    echo "Another px13 action is still running." >&2
+    exit 1
+  fi
+}
+
+set_mode() {
+  local mode="$1" rc=0 profile stapm slow fast
+  read -r profile stapm slow fast <<< "${MODES[$mode]}"
+  with_lock
+  apply_mode "${mode}" || rc=$?
+  if [[ "${mode}" != perf ]]; then
+    set_nvidia_auto
+  fi
+  write_mode "${mode}"
+  publish_state
+
+  local limits
+  limits="$(read_limits || true)"
+  if [[ "${rc}" -eq 0 ]]; then
+    printf 'PX13 %s: %s, %s W (STAPM/slow/fast) via %s, CO -25 - verified\n' \
+      "${mode}" "${profile}" "$(tr ' ' '/' <<< "${limits}")" "$(ec_available && echo EC || echo RyzenAdj)"
+  else
+    printf 'PX13 %s: %s, but limits read %s W; px13-watch will keep retrying.\n' \
+      "${mode}" "${profile}" "$(tr ' ' '/' <<< "${limits:-?}")"
+  fi
+  return "${rc}"
+}
+
+reapply() {
+  local mode
+  with_lock
+  mode="$(stored_mode)"
+  if ! valid_mode "${mode}"; then
+    publish_state
+    exec 9>&-
+    return 0
+  fi
+  # CO resets with the limits, so always send the full set here.
+  if apply_mode "${mode}"; then
+    log "Re-applied ${mode}: $(read_limits)"
+  fi
+  if [[ "${mode}" != perf ]]; then
+    set_nvidia_auto
+  fi
+  publish_state
+  exec 9>&-
+}
+
+check() {
+  local mode limits profile adopted
+  # Skip quietly if a user action currently holds the lock.
+  install -d -m 755 "${RUN_DIR}"
+  exec 9> "${LOCK_FILE}"
+  flock -n 9 || return 0
+  mode="$(stored_mode)"
+  profile="$(current_profile)"
+  adopted="$(profile_mode "${profile}")"
+  if valid_mode "${mode}" && valid_mode "${adopted}" && [[ "${adopted}" != "${mode}" ]]; then
+    # Someone else (KDE's power slider, Fn+F5) picked a profile: follow it.
+    log "Power profile changed to ${profile} outside px13; switching to ${adopted}."
+    write_mode "${adopted}"
+    apply_mode "${adopted}" || true
+    if [[ "${adopted}" != perf ]]; then
+      set_nvidia_auto
+    fi
+  elif valid_mode "${mode}"; then
+    limits="$(read_limits || true)"
+    if [[ -n "${limits}" ]] && ! limits_match "${limits}" "${mode}"; then
+      log "Firmware overrode ${mode} limits (${limits} W); re-applying."
+      apply_mode "${mode}" || true
+    fi
+  fi
+  optimized_apply
+  publish_state
+  exec 9>&-
+}
+
+# Polls the platform profile every 2s without running external commands, and runs
+# the full RyzenAdj check when it changes or every WATCH_INTERVAL seconds.
+# Also tracks AC changes: on unplug the EC reloads its own limits more than
+# once (at ~1-2s and again ~20s), so check at +3s and again at +25s.
+watch_loop() {
+  local tick="${RUN_DIR}/tick" elapsed=0 expected ac="" last_ac="" ac_recheck=-1
+  reapply || true
+  rm -f "${tick}"
+  mkfifo -m 600 "${tick}"
+  exec 8<> "${tick}"
+  read -r last_ac 2>/dev/null < "${AC_ONLINE}" || true
+  printf '0\n' > "${AC_SINCE_FILE}"
+  check || true
+  while true; do
+    read -r -t 2 -u 8 _ || true
+    elapsed=$((elapsed + 2))
+    read -r ac 2>/dev/null < "${AC_ONLINE}" || true
+    expected="$(mode_profile "$(stored_mode)")"
+    if [[ "${ac}" != "${last_ac}" ]]; then
+      last_ac="${ac}"
+      date +%s > "${AC_SINCE_FILE}"
+      read -r -t 3 -u 8 _ || true
+      check || true
+      elapsed=0
+      ac_recheck=22
+    elif [[ "${expected}" != unknown && "$(current_profile)" != "${expected}" ]]; then
+      check || true
+      elapsed=0
+    elif ((ac_recheck > 0)); then
+      ac_recheck=$((ac_recheck - 2))
+      if ((ac_recheck <= 0)); then
+        check || true
+        elapsed=0
+      fi
+    elif ((elapsed >= WATCH_INTERVAL)); then
+      check || true
+      elapsed=0
+    fi
+  done
+}
+
+cycle() {
+  local next
+  case "$(stored_mode)" in
+    eco) next=normal ;;
+    normal) next=perf ;;
+    *) next=eco ;;
+  esac
+  set_mode "${next}"
+}
+
+# Unload the NVIDIA driver so the firmware can eject the GPU. Fails (and
+# names the holders) if something such as the compositor still uses it.
+nvidia_unload() {
+  local mod
+  [[ -d /sys/module/nvidia || -d /sys/module/nouveau ]] || return 0
+  systemctl stop nvidia-persistenced.service nvidia-powerd.service >/dev/null 2>&1 || true
+  for mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia nouveau; do
+    [[ -d "/sys/module/${mod}" ]] && modprobe -r "${mod}" >/dev/null 2>&1 || true
+  done
+  if [[ -d /sys/module/nvidia || -d /sys/module/nouveau ]]; then
+    echo "The NVIDIA driver is still in use; close these and try again:" >&2
+    fuser -v /dev/nvidia* /dev/dri/by-path/pci-0000:c4:00.0-* 2>&1 | sed 's/^/  /' >&2 || true
+    return 1
+  fi
+}
+
+gpu_eco_on() {
+  local dev rc
+  if [[ "$(gpu_eco_state)" == on ]]; then
+    echo "GPU Eco is already on: NVIDIA GPU is powered off by firmware."
+    return 0
+  fi
+  nvidia_unload || return 1
+  # Remaining functions (HDMI audio) are unbound so the eject is clean.
+  for dev in $(nvidia_functions); do
+    if [[ -e "/sys/bus/pci/devices/${dev}/driver" ]]; then
+      printf '%s\n' "${dev}" > "/sys/bus/pci/devices/${dev}/driver/unbind" 2>/dev/null || true
+    fi
+  done
+  echo "Turning GPU Eco on (firmware ejects and powers off the NVIDIA GPU)..."
+  rc="$(wmi_devs "${WMI_GPU_ECO}" 1)"
+  sleep 1
+  if [[ "$(gpu_eco_state)" != on || -n "$(nvidia_functions)" ]]; then
+    echo "GPU Eco did not complete (firmware returned ${rc}); GPU is still on." >&2
+    return 1
+  fi
+  echo "GPU Eco on: NVIDIA GPU powered off. No reboot needed."
+}
+
+gpu_eco_off() {
+  local rc i dev
+  if [[ -e "${ENVY_REMOVE_RULE}" ]]; then
+    echo "EnvyControl integrated mode would delete the GPU; switch with 'px13 hybrid'." >&2
+    return 1
+  fi
+  if [[ "$(gpu_eco_state)" == off && -n "$(nvidia_devices)" ]]; then
+    echo "GPU Eco is already off: NVIDIA GPU is on the bus."
+    return 0
+  fi
+  echo "Turning GPU Eco off..."
+  # The firmware powers the dGPU, sends a Device Check and then waits up to
+  # ~20s for the PCIe link. Linux only brings the link up on a root-port
+  # rescan, so rescan while the firmware is still waiting: the call then
+  # returns 1 within ~1s instead of timing out with 2 (measured: 1.7s total).
+  local out pid
+  out="$(mktemp "${RUN_DIR}/eco-off.XXXXXX")"
+  wmi_devs "${WMI_GPU_ECO}" 0 > "${out}" &
+  pid=$!
+  sleep 1
+  for ((i = 0; i < 50; i++)); do
+    [[ -n "$(nvidia_devices)" ]] && break
+    # Rescan now and every 2s after (slower firmware power-up is harmless).
+    ((i % 4 == 0)) && printf '1\n' > "${NVIDIA_BRIDGE}/rescan"
+    sleep 0.5
+  done
+  wait "${pid}" || true
+  rc="$(cat "${out}")"
+  rm -f "${out}"
+  if [[ "$(gpu_eco_state)" != off ]]; then
+    echo "Firmware did not turn GPU Eco off (returned ${rc})." >&2
+    return 1
+  fi
+  if [[ -z "$(nvidia_devices)" ]]; then
+    printf '1\n' > "${NVIDIA_BRIDGE}/rescan"
+    sleep 1
+  fi
+  if [[ -z "$(nvidia_devices)" ]]; then
+    echo "GPU Eco is off but the GPU did not appear after a rescan." >&2
+    return 1
+  fi
+  # Let an idle GPU drop to D3cold through runtime PM.
+  for dev in $(nvidia_functions); do
+    printf 'auto\n' > "/sys/bus/pci/devices/${dev}/power/control" 2>/dev/null || true
+  done
+  echo "GPU Eco off: NVIDIA GPU on the bus (driver: $(gpu_driver))."
+}
+
+gpu_policy() {
+  local policy=""
+  read -r policy 2>/dev/null < "${GPU_POLICY_FILE}" || true
+  [[ "${policy}" == optimized ]] && echo optimized || echo manual
+}
+
+write_gpu_policy() {
+  install -d -m 755 "${STATE_DIR}"
+  printf '%s\n' "$1" > "${GPU_POLICY_FILE}"
+  chmod 644 "${GPU_POLICY_FILE}"
+}
+
+# Comma-separated names of processes holding the NVIDIA GPU open.
+nvidia_holders() {
+  local pid
+  for pid in $(fuser /dev/nvidia* /dev/dri/by-path/pci-0000:c4:00.0-* 2>/dev/null); do
+    ps -o comm= -p "${pid}" 2>/dev/null || true
+  done | sort -u | paste -sd, -
+}
+
+# Enforce the optimized policy; caller holds the px13 lock.
+optimized_apply() {
+  local since=0 eco
+  if [[ "$(gpu_policy)" != optimized ]] || ! ec_available; then
+    rm -f "${GPU_BUSY_FILE}"
+    return 0
+  fi
+  read -r since 2>/dev/null < "${AC_SINCE_FILE}" || true
+  (( $(date +%s) - ${since:-0} >= OPTIMIZED_SETTLE )) || return 0
+  eco="$(gpu_eco_state)"
+  if ! on_ac && [[ "${eco}" == off ]]; then
+    if gpu_eco_on >/dev/null 2>&1; then
+      rm -f "${GPU_BUSY_FILE}"
+      log "Optimized: on battery, GPU Eco on."
+    else
+      # Same rule as a manual click: never kill apps; retry at the next check.
+      nvidia_holders > "${GPU_BUSY_FILE}"
+      log "Optimized: GPU in use by $(cat "${GPU_BUSY_FILE}"); keeping it on."
+    fi
+  elif on_ac && [[ "${eco}" == on ]]; then
+    rm -f "${GPU_BUSY_FILE}"
+    if [[ -e "${ENVY_REMOVE_RULE}" ]]; then
+      log "Optimized: EnvyControl is in integrated mode; run 'px13 hybrid' once first."
+    elif gpu_eco_off >/dev/null 2>&1; then
+      log "Optimized: on AC, GPU Eco off."
+    else
+      log "Optimized: could not turn GPU Eco off."
+    fi
+  else
+    rm -f "${GPU_BUSY_FILE}"
+  fi
+}
+
+optimized() {
+  with_lock
+  if ! ec_available; then
+    echo "asus-nb-wmi debugfs is not available; cannot switch GPU Eco." >&2
+    return 1
+  fi
+  write_gpu_policy optimized
+  # Apply now rather than waiting for the AC-settle window.
+  printf '0\n' > "${AC_SINCE_FILE}"
+  optimized_apply
+  publish_state
+  local power="battery" gpu="on"
+  on_ac && power="AC"
+  [[ "$(gpu_eco_state)" == on ]] && gpu="off (GPU Eco)"
+  echo "GPU Optimized: Eco on battery, Hybrid on AC. Now on ${power}, GPU ${gpu}."
+  if [[ -s "${GPU_BUSY_FILE}" ]]; then
+    echo "GPU kept on: in use by $(cat "${GPU_BUSY_FILE}"). It switches once they close."
+  fi
+}
+
+presence() {
+  local unit=px13-presence.service ctl=/run/px13/presence.d
+  case "${1:-}" in
+    on)
+      systemctl enable --now "${unit}" >/dev/null 2>&1 || { echo "Could not start ${unit}." >&2; return 1; }
+      echo "Presence sensor service on." ;;
+    off)
+      systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+      echo "Presence sensor service off; the webcam sensor is released." ;;
+    active|standby)
+      install -d -m 755 "${ctl}"
+      printf '%s\n' "$1" > "${ctl}/mode.tmp"
+      chmod 644 "${ctl}/mode.tmp"
+      mv -f "${ctl}/mode.tmp" "${ctl}/mode"
+      echo "Presence sensor ${1}." ;;
+    status)
+      echo "service: $(systemctl is-active "${unit}" 2>/dev/null) ($(systemctl is-enabled "${unit}" 2>/dev/null))"
+      cat /run/px13/presence.json 2>/dev/null || echo "no state published" ;;
+    *)
+      echo "Usage: px13 presence {on|off|active|standby|status}" >&2
+      return 2 ;;
+  esac
+}
+
+deep_eco() {
+  with_lock
+  write_gpu_policy manual
+  rm -f "${GPU_BUSY_FILE}"
+  if ! ec_available; then
+    echo "asus-nb-wmi debugfs is not available; cannot switch GPU Eco." >&2
+    return 1
+  fi
+  local rc=0
+  gpu_eco_on || rc=$?
+  publish_state
+  return "${rc}"
+}
+
+hybrid() {
+  with_lock
+  write_gpu_policy manual
+  rm -f "${GPU_BUSY_FILE}"
+  if ! ec_available; then
+    echo "asus-nb-wmi debugfs is not available; cannot switch GPU Eco." >&2
+    return 1
+  fi
+  local rc=0
+  if [[ "$(gpu_config)" == integrated ]]; then
+    if [[ ! -x "${ENVYCONTROL}" || ! -x "${ENVYCONTROL_HELPER}" ]]; then
+      echo "EnvyControl integrated mode is set but EnvyControl is not usable." >&2
+      return 1
+    fi
+    echo "Switching EnvyControl to hybrid (rebuilds initramfs, a few minutes)..."
+    "${ENVYCONTROL_HELPER}" hybrid-rtd3 || { publish_state; return 1; }
+    udevadm control --reload
+  fi
+  gpu_eco_off || rc=$?
+  publish_state
+  if [[ "${rc}" -eq 0 ]]; then
+    case "$(gpu_driver_issue)" in
+      no_module)
+        echo "No NVIDIA module for kernel $(uname -r); install linux-modules-nvidia-*-$(uname -r). The GPU idles in D3cold." ;;
+      blacklisted)
+        echo "Reboot to load the NVIDIA driver; the GPU idles in D3cold until then." ;;
+      not_loaded)
+        echo "NVIDIA driver not loaded; run 'sudo modprobe nvidia_drm' or reboot. The GPU idles in D3cold." ;;
+    esac
+  fi
+  return "${rc}"
+}
+
+battery_report() {
+  local bat=/sys/class/power_supply/BAT0 power status
+  [[ -d "${bat}" ]] || { echo "No battery found."; return 0; }
+  status="$(cat "${bat}/status" 2>/dev/null || echo '?')"
+  power="$(awk '{ printf "%.1f", $1 / 1000000 }' "${bat}/power_now" 2>/dev/null || echo '?')"
+  printf '%s%% %s, %s W, charge limit %s%%\n' \
+    "$(cat "${bat}/capacity" 2>/dev/null || echo '?')" "${status,,}" "${power}" \
+    "$(cat "${bat}/charge_control_end_threshold" 2>/dev/null || echo '?')"
+}
+
+status() {
+  local mode limits dev
+  mode="$(stored_mode)"
+  limits="$(read_limits || true)"
+  publish_state
+
+  echo "Mode:           ${mode}"
+  echo "Power profile:  $(current_profile)"
+  echo "Live limits:    $(tr ' ' '/' <<< "${limits:-unknown}") W (STAPM/slow/fast)"
+  echo "Applied:        $(sed -n 's/^applied=//p' "${LIVE_FILE}")"
+  echo "Battery:        $(battery_report)"
+  echo "GPU Eco:        $(sed -n 's/^gpu_eco=//p' "${LIVE_FILE}") (firmware; driver: $(sed -n 's/^gpu_driver=//p' "${LIVE_FILE}"), EnvyControl config: $(gpu_config), reboot pending: $(sed -n 's/^reboot_pending=//p' "${LIVE_FILE}"))"
+  for dev in $(nvidia_devices); do
+    echo "NVIDIA ${dev}: control=$(cat "/sys/bus/pci/devices/${dev}/power/control" 2>/dev/null || echo '?') status=$(cat "/sys/bus/pci/devices/${dev}/power/runtime_status" 2>/dev/null || echo '?')"
+  done
+  echo "Watcher:        $(systemctl is-active px13-watch.service 2>/dev/null || true)"
+
+  if [[ -n "$(nvidia_devices)" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    echo
+    echo "NVIDIA-SMI (this wakes the GPU):"
+    nvidia-smi || true
+  fi
+
+  echo
+  echo "RyzenAdj:"
+  "${RYZENADJ}" -i 2>/dev/null || echo "RyzenAdj not available."
+}
+
+# ---------------------------------------------------------------------- main
+
+cmd="${1:-}"
+case "${cmd}" in
+  eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|presence|reapply|check|watch|state) ;;
+  *) usage; exit 1 ;;
+esac
+
+# Everything below needs root; re-run through the sudoers rule for px13.
+if [[ "${EUID}" -ne 0 ]]; then
+  if [[ "${cmd}" == state && -r "${LIVE_FILE}" ]]; then
+    cat "${LIVE_FILE}"
+    exit 0
+  fi
+  if ! sudo -n -l "${SELF}" >/dev/null 2>&1; then
+    echo "Passwordless sudo for ${SELF} is not available. Check /etc/sudoers.d/px13-power." >&2
+    exit 1
+  fi
+  rc=0
+  sudo -n "${SELF}" "$@" || rc=$?
+  case "${cmd}" in
+    eco|normal|perf|cycle)
+      if [[ "${rc}" -eq 0 ]]; then
+        notify "PX13 $(stored_mode) mode" "Power limits applied and verified"
+      else
+        notify "PX13 power mode" "Limits did not verify; see 'px13 status'"
+      fi
+      ;;
+  esac
+  exit "${rc}"
+fi
+
+case "${cmd}" in
+  eco|normal|perf) set_mode "${cmd}" ;;
+  cycle) cycle ;;
+  status) status ;;
+  deep-eco) deep_eco ;;
+  hybrid) hybrid ;;
+  optimized) optimized ;;
+  presence) presence "${2:-}" ;;
+  reapply) reapply ;;
+  check) check ;;
+  watch) watch_loop ;;
+  state) publish_state; cat "${LIVE_FILE}" ;;
+esac

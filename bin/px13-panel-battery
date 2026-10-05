@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Battery charge limit for the PX13 widget. asusd owns this setting (it
+# restores it at boot from /etc/asusd/asusd.ron), so go through asusctl
+# rather than writing sysfs, which asusd would undo.
+set -euo pipefail
+
+case "${1:-}" in
+  limit)
+    pct="${2:-}"
+    if [[ ! "${pct}" =~ ^[0-9]+$ ]] || ((pct < 20 || pct > 100)); then
+      echo "Charge limit must be 20-100." >&2
+      exit 2
+    fi
+    asusctl battery limit "${pct}" >/dev/null
+    echo "Battery charge limit set to ${pct}%."
+    ;;
+  oneshot)
+    asusctl battery oneshot >/dev/null
+    echo "Charging to 100% once; the limit returns afterwards."
+    ;;
+  *)
+    echo "Usage: px13-panel-battery {limit <20-100>|oneshot}" >&2
+    exit 2
+    ;;
+esac

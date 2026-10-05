@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "madhan@localhost",
+                "Name": "Madhan"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Dropdown controls for PX13 power modes",
+        "EnabledByDefault": false,
+        "Icon": "preferences-system-power-management",
+        "Id": "org.madhan.px13power",
+        "License": "MIT",
+        "Name": "PX13 Power Menu",
+        "Version": "1.1"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "Hardware"
+}

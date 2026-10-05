@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PX13 Presence
+Comment=Live view and settings for the webcam presence sensor
+Exec=plasmawindowed org.madhan.px13presence
+Icon=user-available-symbolic
+Categories=Settings;HardwareSettings;
+Terminal=false

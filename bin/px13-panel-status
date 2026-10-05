@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# key=value status for the Plasma widget. Reads only files; never calls sudo.
+set -uo pipefail
+
+LIVE_FILE="/run/px13/state"
+MODE_FILE="/var/lib/px13/mode"
+BAT="/sys/class/power_supply/BAT0"
+
+if [[ -r "${LIVE_FILE}" ]]; then
+  cat "${LIVE_FILE}"
+  echo "watcher=yes"
+else
+  # Watcher not running: fall back to what can be read without root.
+  mode="$(tr -d '[:space:]' < "${MODE_FILE}" 2>/dev/null || true)"
+  echo "mode=${mode:-unknown}"
+  case "$(cat /sys/firmware/acpi/platform_profile 2>/dev/null)" in
+    quiet|low-power) echo "profile=power-saver" ;;
+    balanced) echo "profile=balanced" ;;
+    performance) echo "profile=performance" ;;
+    *) echo "profile=unknown" ;;
+  esac
+  echo "applied=unknown"
+  echo "watcher=no"
+fi
+
+echo "battery_percent=$(cat "${BAT}/capacity" 2>/dev/null || echo '')"
+echo "battery_status=$(cat "${BAT}/status" 2>/dev/null || echo '')"
+awk '{ printf "battery_watts=%.1f\n", $1 / 1000000 }' "${BAT}/power_now" 2>/dev/null || echo "battery_watts="
+echo "charge_limit=$(cat "${BAT}/charge_control_end_threshold" 2>/dev/null || echo '')"
+# asusd's normal limit; differs from the live one during a one-shot full charge.
+echo "charge_limit_base=$(sed -n 's/^ *base_charge_control_end_threshold: *\([0-9]*\).*/\1/p' /etc/asusd/asusd.ron 2>/dev/null)"
+echo "ac_online=$(cat /sys/class/power_supply/AC0/online 2>/dev/null || echo '')"
+# dGPU runtime power state (active / suspended), readable without root.
+gpu_rt=""
+for dev in /sys/bus/pci/devices/*; do
+  [[ "$(cat "${dev}/vendor" 2>/dev/null)" == 0x10de && "$(cat "${dev}/class" 2>/dev/null)" == 0x03* ]] || continue
+  gpu_rt="$(cat "${dev}/power/runtime_status" 2>/dev/null)"
+done
+echo "gpu_runtime=${gpu_rt}"

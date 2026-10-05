@@ -317,7 +317,8 @@ PlasmoidItem {
                     PlasmaComponents3.Label {
                         Layout.fillWidth: true
                         text: [root.agent.dimmed ? "Screen dimmed by presence" : "",
-                               root.agent.awake ? "Keeping the screen awake" : "",
+                               root.agent.screen_held ? "Keeping the screen on"
+                                   : root.agent.sleep_held ? "Preventing sleep" : "",
                                root.agent.last_action ? "Last: " + root.agent.last_action + " (" + root.ago(root.agent.last_action_at) + ")" : "No actions yet",
                                root.agent.inhibited ? "Paused: an app is inhibiting idle" : ""]
                               .filter(t => t.length > 0).join("  ·  ")
@@ -372,8 +373,20 @@ PlasmoidItem {
                         PlasmaComponents3.CheckBox {
                             Layout.columnSpan: 3
                             text: "Keep the screen on while I'm looking at it"
-                            checked: root.cfg.keep_awake !== false
-                            onToggled: root.setting("keep_awake", checked)
+                            checked: root.cfg.keep_screen_on !== false
+                            onToggled: root.setting("keep_screen_on", checked)
+                        }
+
+                        // Keeping the screen on also blocks sleep (Plasma ties the two),
+                        // so this only matters on its own.
+                        PlasmaComponents3.CheckBox {
+                            Layout.columnSpan: 3
+                            readonly property bool implied: root.cfg.keep_screen_on !== false
+                            text: implied ? "Don't sleep while I'm looking at the screen (included above)"
+                                          : "Don't sleep while I'm looking at the screen"
+                            enabled: !implied
+                            checked: implied || root.cfg.prevent_sleep !== false
+                            onToggled: root.setting("prevent_sleep", checked)
                         }
 
                         PlasmaComponents3.CheckBox {

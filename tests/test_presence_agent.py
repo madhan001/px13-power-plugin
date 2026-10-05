@@ -19,10 +19,10 @@ _loader.exec_module(agent)
 
 Config, Memory, Sensor, decide = agent.Config, agent.Memory, agent.Sensor, agent.decide
 
-# keep_awake is off here so the lock/dim tests see only their own actions;
-# KeepAwakeTests covers it.
-CFG = Config(enabled=True, lock=True, lock_after=60, dim=True, dim_after=10,
-             dim_level=30, keep_awake=False, wake_on_return=False)
+# The looking inhibitions are off here so the lock/dim tests see only their
+# own actions; LookingTests covers them.
+CFG = Config(enabled=True, lock=True, lock_after=60, dim=True, dim_after=10, dim_level=30,
+             keep_screen_on=False, prevent_sleep=False, wake_on_return=False)
 ACTIVE = Memory(sensor_mode="active")
 T0 = 1000.0
 
@@ -109,40 +109,47 @@ class LockedSessionTests(unittest.TestCase):
         self.assertEqual(decide(T0 + 6, sensor(present=True), True, cfg, back.memory).actions, [])
 
 
-class KeepAwakeTests(unittest.TestCase):
-    AWAKE = replace(CFG, keep_awake=True)
+class LookingTests(unittest.TestCase):
+    """keep_screen_on / prevent_sleep inhibitions while you look at the screen."""
+    BOTH = replace(CFG, keep_screen_on=True, prevent_sleep=True)
+    HELD = replace(ACTIVE, screen_held=True, sleep_held=True)
 
-    def test_holds_while_looking(self):
-        d = decide(T0, sensor(), False, self.AWAKE, ACTIVE)
-        self.assertEqual(d.actions, ["awake:hold"])
-        self.assertEqual(decide(T0 + 1, sensor(), False, self.AWAKE, d.memory).actions, [])
+    def test_holds_both_while_looking(self):
+        d = decide(T0, sensor(), False, self.BOTH, ACTIVE)
+        self.assertEqual(d.actions, ["screen:hold", "sleep:hold"])
+        self.assertEqual(decide(T0 + 1, sensor(), False, self.BOTH, d.memory).actions, [])
+
+    def test_options_are_independent(self):
+        sleep_only = decide(T0, sensor(), False, replace(CFG, prevent_sleep=True), ACTIVE)
+        self.assertEqual(sleep_only.actions, ["sleep:hold"])
+        screen_only = decide(T0, sensor(), False, replace(CFG, keep_screen_on=True), ACTIVE)
+        self.assertEqual(screen_only.actions, ["screen:hold"])
+        self.assertEqual(decide(T0, sensor(), False, CFG, ACTIVE).actions, [])
+
+    def test_turning_one_off_releases_only_it(self):
+        d = decide(T0, sensor(), False, replace(self.BOTH, prevent_sleep=False), self.HELD)
+        self.assertEqual(d.actions, ["sleep:release"])
 
     def test_grace_after_looking_away_then_release(self):
-        held = replace(ACTIVE, awake=True)
         s = sensor(attention=False, looking_away_since=T0)
-        d = decide(T0 + 5, s, False, self.AWAKE, held)
-        self.assertNotIn("awake:release", d.actions)
+        d = decide(T0 + 5, s, False, self.BOTH, self.HELD)
+        self.assertEqual(d.actions, [])
         self.assertEqual(d.wake_at, T0 + 10)   # the dim comes first
-        d = decide(T0 + agent.KEEP_AWAKE_GRACE, s, False, self.AWAKE, replace(held, dimmed=True))
-        self.assertEqual(d.actions, ["awake:release"])
+        d = decide(T0 + agent.LOOK_GRACE, s, False, self.BOTH, replace(self.HELD, dimmed=True))
+        self.assertEqual(d.actions, ["screen:release", "sleep:release"])
 
     def test_released_when_leaving_or_locked(self):
-        held = replace(ACTIVE, awake=True)
         away = sensor(present=False, attention=False, away_since=T0, looking_away_since=T0)
-        self.assertIn("awake:release", decide(T0 + 1, away, False, self.AWAKE, held).actions)
-        self.assertIn("awake:release", decide(T0, sensor(), True, self.AWAKE, held).actions)
+        for d in (decide(T0 + 1, away, False, self.BOTH, self.HELD),
+                  decide(T0, sensor(), True, self.BOTH, self.HELD)):
+            self.assertIn("screen:release", d.actions)
+            self.assertIn("sleep:release", d.actions)
 
-    def test_released_when_sensor_not_ready(self):
-        d = decide(T0, Sensor(), False, self.AWAKE, replace(ACTIVE, awake=True))
-        self.assertIn("awake:release", d.actions)
-
-    def test_released_when_disabled(self):
-        d = decide(T0, sensor(), False, replace(self.AWAKE, enabled=False),
-                   replace(ACTIVE, awake=True))
-        self.assertIn("awake:release", d.actions)
-
-    def test_setting_off(self):
-        self.assertEqual(decide(T0, sensor(), False, CFG, ACTIVE).actions, [])
+    def test_released_when_sensor_not_ready_or_disabled(self):
+        for d in (decide(T0, Sensor(), False, self.BOTH, self.HELD),
+                  decide(T0, sensor(), False, replace(self.BOTH, enabled=False), self.HELD)):
+            self.assertIn("screen:release", d.actions)
+            self.assertIn("sleep:release", d.actions)
 
 
 class DisabledTests(unittest.TestCase):

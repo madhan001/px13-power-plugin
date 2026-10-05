@@ -6,8 +6,9 @@ Reads the state published by the root px13-presence service and, per
   * locks the session after you have been away for `lock_after` seconds,
   * dims the built-in screen after you have looked away for `dim_after`
     seconds and restores it when you look back,
-  * keeps the screen awake (no idle dim, blank or lock) while you are
-    looking at it, by holding a screen-saver inhibition,
+  * while you are looking at the screen, keeps it on (no idle dim, blank
+    or lock; this also prevents sleep) and/or prevents only sleep, by
+    holding Plasma inhibitions,
   * optionally wakes the screen when you return to a locked session.
 
 It also puts the sensor in standby while the session is locked (unless
@@ -41,9 +42,9 @@ except ImportError:
 STATE_FILE = "/run/px13/presence.json"
 CONFIG_FILE = os.path.expanduser("~/.config/px13/presence.conf")
 AGENT_FILE = os.path.expanduser("~/.cache/px13/presence-agent.json")
-APP_NAME = "PX13 Presence"   # shown in Plasma's battery applet while keeping awake
+APP_NAME = "PX13 Presence"   # shown in Plasma's battery applet while an inhibition is held
 INHIBIT_RETRY = 30.0  # seconds before re-checking when an inhibitor blocked an action
-KEEP_AWAKE_GRACE = 30.0  # keep the screen awake this long after you look away
+LOOK_GRACE = 30.0  # keep-on / no-sleep last this long after you look away
 
 
 # ----------------------------------------------------------------- config ---
@@ -56,7 +57,8 @@ class Config:
     dim: bool = True
     dim_after: int = 10        # seconds looking away (while present) before dimming
     dim_level: int = 30        # percent of maximum brightness
-    keep_awake: bool = True    # no idle dim/blank/lock while you look at the screen
+    keep_screen_on: bool = True  # no idle dim/blank/lock (nor sleep) while you look at the screen
+    prevent_sleep: bool = True   # no idle sleep while you look at the screen
     wake_on_return: bool = False
 
     LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
@@ -75,7 +77,8 @@ def load_config(path=CONFIG_FILE, log=print):
         return cfg
     sec = parser["presence"]
     values = {}
-    for name in ("enabled", "lock", "dim", "keep_awake", "wake_on_return"):
+    for name in ("enabled", "lock", "dim", "keep_screen_on", "prevent_sleep",
+                 "wake_on_return"):
         try:
             values[name] = sec.getboolean(name, fallback=getattr(cfg, name))
         except ValueError:
@@ -112,7 +115,8 @@ class Sensor:
 class Memory:
     """What the agent has already done (so each action happens once)."""
     dimmed: bool = False
-    awake: bool = False                     # holding the keep-awake inhibition
+    screen_held: bool = False               # holding the keep-screen-on inhibition
+    sleep_held: bool = False                # holding the no-sleep inhibition
     locked_for_away: float = -1.0          # away_since of the period we locked for
     woke_for_return: bool = False
     sensor_mode: str = ""                   # last mode we requested
@@ -121,7 +125,8 @@ class Memory:
 
 @dataclass
 class Decision:
-    # "lock", "dim", "restore", "wake", "awake:hold|release", "sensor:active|standby"
+    # "lock", "dim", "restore", "wake", "screen:hold|release", "sleep:hold|release",
+    # "sensor:active|standby"
     actions: list = field(default_factory=list)
     memory: Memory = Memory()
     wake_at: float = None                          # next time decide() must run, or None
@@ -139,12 +144,15 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
         if t > now and (d.wake_at is None or t < d.wake_at):
             d.wake_at = t
 
-    def keep_awake(want):
-        if d.memory.awake != want:
-            act.append("awake:hold" if want else "awake:release"); set_mem(awake=want)
+    def hold(screen, sleep):
+        """Hold or release the keep-screen-on and no-sleep inhibitions."""
+        if d.memory.screen_held != screen:
+            act.append("screen:" + ("hold" if screen else "release")); set_mem(screen_held=screen)
+        if d.memory.sleep_held != sleep:
+            act.append("sleep:" + ("hold" if sleep else "release")); set_mem(sleep_held=sleep)
 
     if not cfg.enabled:
-        keep_awake(False)
+        hold(False, False)
         if mem.dimmed:
             act.append("restore"); set_mem(dimmed=False)
         if mem.sensor_mode != "standby":
@@ -157,7 +165,7 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
         act.append("sensor:" + want); set_mem(sensor_mode=want)
 
     if locked:
-        keep_awake(False)
+        hold(False, False)
         if mem.dimmed:                          # never leave the lock screen dimmed by us
             act.append("restore"); set_mem(dimmed=False)
         if cfg.wake_on_return and sensor.ready:
@@ -169,23 +177,23 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
 
     set_mem(woke_for_return=False)
     if not sensor.ready:
-        keep_awake(False)   # never suppress idle locking on a sensor we cannot read
+        hold(False, False)   # never suppress idle locking or sleep on a sensor we cannot read
         if mem.dimmed:
             act.append("restore"); set_mem(dimmed=False)
         return d
 
     blocked = inhibited or now < mem.inhibited_until
 
-    # Keep awake: while you look at the screen (and for a grace period after
-    # you look away) hold an idle inhibition, so Plasma neither dims, blanks
-    # nor idle-locks a screen that is being read. Leaving releases it.
-    if cfg.keep_awake and sensor.present:
-        until = sensor.looking_away_since + KEEP_AWAKE_GRACE
-        keep_awake(sensor.attention or now < until)
+    # While you look at the screen (and for a grace period after you look
+    # away), hold Plasma inhibitions so a screen that is being read is not
+    # dimmed, blanked, idle-locked or put to sleep. Leaving releases them.
+    looking = False
+    if sensor.present and (cfg.keep_screen_on or cfg.prevent_sleep):
+        until = sensor.looking_away_since + LOOK_GRACE
+        looking = sensor.attention or now < until
         if not sensor.attention:
             deadline(until)
-    else:
-        keep_awake(False)
+    hold(looking and cfg.keep_screen_on, looking and cfg.prevent_sleep)
 
     # Adaptive dimming: dim after looking away while present; restore exactly
     # when attention returns. Walking away keeps it dimmed (cheaper) until the
@@ -225,6 +233,13 @@ class Session:
     """
 
     SCREENSAVER = ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver")
+    # Inhibitions: the screen-saver one blocks dim, blank, idle lock and sleep;
+    # the power-management one blocks sleep only.
+    INHIBITORS = {
+        "screen": (SCREENSAVER, "You are looking at the screen"),
+        "sleep": (("org.freedesktop.PowerManagement.Inhibit", "/org/freedesktop/PowerManagement/Inhibit",
+                   "org.freedesktop.PowerManagement.Inhibit"), "You are looking at the screen"),
+    }
     BRIGHTNESS = ("org.kde.ScreenBrightness", "/org/kde/ScreenBrightness/display0",
                   "org.kde.ScreenBrightness.Display")
     POLICY = ("org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement/PolicyAgent",
@@ -236,7 +251,7 @@ class Session:
         self.bus = dbus.SessionBus()
         self.saved_brightness = None
         self.dim_value = None
-        self.inhibit_cookie = None
+        self.cookies = {}   # "screen"/"sleep" -> inhibition cookie
 
     def _call(self, target, method, *args):
         service, path, iface = target
@@ -261,7 +276,7 @@ class Session:
     def inhibited(self):
         """True while something else (video, presentation) inhibits idle actions.
 
-        Our own keep-awake inhibition is excluded, or it would block our dim.
+        Our own inhibitions are excluded, or they would block our dim.
         """
         try:
             active = self._prop(self.POLICY, "ActiveInhibitions")
@@ -287,14 +302,13 @@ class Session:
                     if int(self._prop(self.BRIGHTNESS, "Brightness")) == self.dim_value:
                         self._set_brightness(self.saved_brightness)
                     self.saved_brightness = self.dim_value = None
-            elif action == "awake:hold":
-                if self.inhibit_cookie is None:
-                    self.inhibit_cookie = int(self._call(
-                        self.SCREENSAVER, "Inhibit", APP_NAME, "You are looking at the screen"))
-            elif action == "awake:release":
-                if self.inhibit_cookie is not None:
-                    cookie, self.inhibit_cookie = self.inhibit_cookie, None
-                    self._call(self.SCREENSAVER, "UnInhibit", dbus.UInt32(cookie))
+            elif action.split(":")[0] in self.INHIBITORS:
+                kind, verb = action.split(":")
+                target, reason = self.INHIBITORS[kind]
+                if verb == "hold" and kind not in self.cookies:
+                    self.cookies[kind] = int(self._call(target, "Inhibit", APP_NAME, reason))
+                elif verb == "release" and kind in self.cookies:
+                    self._call(target, "UnInhibit", dbus.UInt32(self.cookies.pop(kind)))
             elif action == "wake":
                 subprocess.run(["kscreen-doctor", "--dpms", "on"], capture_output=True, timeout=5)
             elif action.startswith("sensor:"):
@@ -393,7 +407,8 @@ def main():
                 session.apply(action, cfg)
             mem = d.memory
 
-            agent = {"locked": locked, "dimmed": mem.dimmed, "awake": mem.awake,
+            agent = {"locked": locked, "dimmed": mem.dimmed,
+                     "screen_held": mem.screen_held, "sleep_held": mem.sleep_held,
                      "sensor_mode": mem.sensor_mode,
                      "config": cfg.__dict__, "inhibited": inhibited,
                      "next_check": d.wake_at}
@@ -427,8 +442,9 @@ def main():
     finally:
         if mem.dimmed:
             session.apply("restore", cfg)
-        if mem.awake:
-            session.apply("awake:release", cfg)
+        for kind, held in (("screen", mem.screen_held), ("sleep", mem.sleep_held)):
+            if held:
+                session.apply(kind + ":release", cfg)
         monitor.terminate()
     return 0
 

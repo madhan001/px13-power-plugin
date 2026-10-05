@@ -56,7 +56,7 @@ declare -A MODES=(
 
 usage() {
   cat <<'EOF'
-Usage: px13 {eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|presence|reapply|check|watch|state}
+Usage: px13 {eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|reapply|check|watch|state}
 
   eco       power-saver, 15W/15W/20W, CO -25, NVIDIA PCI runtime auto
   normal    balanced, 25W/25W/35W, CO -25, NVIDIA PCI runtime auto
@@ -69,8 +69,6 @@ Usage: px13 {eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|presence|rea
             EnvyControl integrated rebuilds the driver config, ~3 min)
   optimized GPU follows power: Eco on battery, Hybrid on AC (deep-eco or
             hybrid switch back to manual)
-  presence  on|off|active|standby|status - webcam presence sensor service
-            (on/off: enable/disable it; active/standby: sensor streaming/off)
   reapply   re-apply the stored mode (used after boot, resume and AC changes)
   check     re-apply the stored mode only if firmware has overridden the limits
   watch     follow profile/AC changes, check every 60s, publish state (px13-watch.service)
@@ -764,30 +762,6 @@ optimized() {
   fi
 }
 
-presence() {
-  local unit=px13-presence.service ctl=/run/px13/presence.d
-  case "${1:-}" in
-    on)
-      systemctl enable --now "${unit}" >/dev/null 2>&1 || { echo "Could not start ${unit}." >&2; return 1; }
-      echo "Presence sensor service on." ;;
-    off)
-      systemctl disable --now "${unit}" >/dev/null 2>&1 || true
-      echo "Presence sensor service off; the webcam sensor is released." ;;
-    active|standby)
-      install -d -m 755 "${ctl}"
-      printf '%s\n' "$1" > "${ctl}/mode.tmp"
-      chmod 644 "${ctl}/mode.tmp"
-      mv -f "${ctl}/mode.tmp" "${ctl}/mode"
-      echo "Presence sensor ${1}." ;;
-    status)
-      echo "service: $(systemctl is-active "${unit}" 2>/dev/null) ($(systemctl is-enabled "${unit}" 2>/dev/null))"
-      cat /run/px13/presence.json 2>/dev/null || echo "no state published" ;;
-    *)
-      echo "Usage: px13 presence {on|off|active|standby|status}" >&2
-      return 2 ;;
-  esac
-}
-
 deep_eco() {
   with_lock
   write_gpu_policy manual
@@ -877,7 +851,7 @@ status() {
 
 cmd="${1:-}"
 case "${cmd}" in
-  eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|presence|reapply|check|watch|state) ;;
+  eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|reapply|check|watch|state) ;;
   *) usage; exit 1 ;;
 esac
 
@@ -912,7 +886,6 @@ case "${cmd}" in
   deep-eco) deep_eco ;;
   hybrid) hybrid ;;
   optimized) optimized ;;
-  presence) presence "${2:-}" ;;
   reapply) reapply ;;
   check) check ;;
   watch) watch_loop ;;

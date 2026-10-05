@@ -17,7 +17,7 @@ CONFIG_FILE = os.path.expanduser("~/.config/px13/presence.conf")
 STATE_FILE = "/run/px13/presence.json"
 AGENT_FILE = os.path.expanduser("~/.cache/px13/presence-agent.json")
 
-BOOLS = {"enabled", "lock", "dim", "wake_on_return"}
+BOOLS = {"enabled", "lock", "dim", "keep_awake", "wake_on_return"}
 INTS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
 
 

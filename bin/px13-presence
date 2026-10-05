@@ -13,6 +13,16 @@ sensor is only streamed in "active" mode and at a low rate (2 Hz). The loop
 blocks on the sensor fd and an inotify watch on the control file, so there is
 no timer polling; it wakes only for samples or a mode change.
 
+Noise: presence and attention must hold for CONFIRM_SAMPLES consecutive
+samples before they change (a one-sample blip neither restores a dimmed
+screen nor restarts a timer); the *_since timestamps still record the first
+sample of the new state. Distance has hysteresis so jitter does not rewrite
+the file (each write wakes the session agent).
+
+Privacy: whether you are at the desk is personal, so the state file is
+mode 0640, group = the service's Group= (set to the desktop user's group by
+install.sh). Without a Group= it stays root-only.
+
 Files:
   /run/px13/presence.json   published state (written only when it changes)
   /run/px13/presence.d/mode "active" (default) or "standby" (sensor off)
@@ -38,6 +48,10 @@ WEBCAM_USB_ID = "3277:0059"
 SAMPLE_HZ = float(os.environ.get("PX13_PRESENCE_HZ", "2"))
 DEVICE_OVERRIDE = os.environ.get("PX13_PRESENCE_IIO")  # e.g. "iio:device1"
 RETRY_DELAY = 2.0  # only used while the webcam is missing
+CONFIRM_SAMPLES = 2    # consecutive samples needed to change present/attention (1 s at 2 Hz)
+DISTANCE_STEP = 50     # mm; published distance is rounded to this
+DISTANCE_HYSTERESIS = 75  # mm the raw distance must move before it is republished
+STATE_MODE = 0o640
 
 IN_CLOSE_WRITE = 0x08
 IN_MOVED_TO = 0x80
@@ -143,17 +157,51 @@ def decode(chans, rec):
     return vals
 
 
+class Debounced:
+    """A boolean that only changes after `samples` consecutive agreeing samples."""
+
+    def __init__(self, value, samples=CONFIRM_SAMPLES):
+        self.value = value
+        self.samples = samples
+        self.count = 0
+        self.first = None   # time of the first sample of the pending change
+
+    def feed(self, raw, now):
+        """Feed one sample; return the time the change began if it is now confirmed."""
+        if raw == self.value:
+            self.count = 0
+            return None
+        if self.count == 0:
+            self.first = now
+        self.count += 1
+        if self.count < self.samples:
+            return None
+        self.value, self.count = raw, 0
+        return self.first
+
+
 class Presence:
     def __init__(self):
-        now = time.time()
         self.state = {
-            "mode": "active", "sensor": None, "sensor_ready": False,
-            "present": False, "attention": False, "distance_mm": None,
-            "present_since": None, "away_since": now,
-            "attention_since": None, "looking_away_since": now,
+            "mode": "active", "sensor": None, "present_since": None, "attention_since": None,
             "rate_hz": SAMPLE_HZ, "pid": os.getpid(),
         }
         self.published = None
+        self.reset()   # fills the sensor fields
+
+    def reset(self):
+        """Forget sensor history (stream stopped or restarting).
+
+        The away/looking-away clocks restart too: time spent with the sensor
+        off (e.g. locked) must not count as time away once it is back.
+        """
+        self.present = Debounced(False)
+        self.attention = Debounced(False)
+        self.raw_distance = None
+        self.samples = 0
+        now = time.time()
+        self.state.update(sensor_ready=False, present=False, attention=False, distance_mm=None,
+                          away_since=now, looking_away_since=now)
 
     def publish(self):
         """Write the state file, but only if something changed."""
@@ -161,9 +209,11 @@ class Presence:
             return
         self.state["changed"] = time.time()
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        # Create with the final mode: never briefly world-readable.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, STATE_MODE)
+        os.fchmod(fd, STATE_MODE)
+        with os.fdopen(fd, "w") as f:
             json.dump(self.state, f)
-        os.chmod(tmp, 0o644)
         os.replace(tmp, STATE_FILE)
         self.published = dict(self.state)
         del self.state["changed"]
@@ -171,20 +221,36 @@ class Presence:
 
     def update(self, vals, now):
         s = self.state
-        present = bool(vals.get("in_proximity0", 0))
-        attention = present and bool(vals.get("in_attention", 0))
-        # Distance jitters by a few cm and nothing acts on it (it is shown in
-        # the test UI only), so publish 50 mm steps to avoid rewriting the
-        # state file - and waking its readers - for noise.
-        distance = int(round(vals.get("in_proximity1", 0) / 50.0)) * 50 if present else None
-        if present != s["present"]:
-            s["present"] = present
-            s["present_since" if present else "away_since"] = now
-        if attention != s["attention"]:
-            s["attention"] = attention
-            s["attention_since" if attention else "looking_away_since"] = now
-        s["distance_mm"] = distance
-        s["sensor_ready"] = True
+        raw_present = bool(vals.get("in_proximity0", 0))
+        changed_at = self.present.feed(raw_present, now)
+        if changed_at is not None:
+            s["present"] = self.present.value
+            s["present_since" if s["present"] else "away_since"] = changed_at
+        # Attention only counts while present (debounced separately, so a
+        # flicker of either input cannot flip it on its own).
+        changed_at = self.attention.feed(raw_present and bool(vals.get("in_attention", 0)), now)
+        if changed_at is not None:
+            s["attention"] = self.attention.value
+            s["attention_since" if s["attention"] else "looking_away_since"] = changed_at
+        if s["attention"] and not s["present"]:
+            # Presence was lost first; looking away began then.
+            s["attention"] = False
+            s["looking_away_since"] = s["away_since"]
+            self.attention = Debounced(False)
+        # Distance is shown in the test UI only: publish it in DISTANCE_STEP
+        # steps, and only when it moves past the hysteresis band, so jitter
+        # does not rewrite the file (and wake its readers).
+        if not s["present"]:
+            self.raw_distance = None
+            s["distance_mm"] = None
+        else:
+            raw = vals.get("in_proximity1", 0)
+            if self.raw_distance is None or abs(raw - self.raw_distance) >= DISTANCE_HYSTERESIS:
+                self.raw_distance = raw
+                s["distance_mm"] = int(round(raw / float(DISTANCE_STEP))) * DISTANCE_STEP
+        # Ready once the debounce has seen enough samples to have an opinion.
+        self.samples += 1
+        s["sensor_ready"] = self.samples >= CONFIRM_SAMPLES
 
 
 def wanted_mode():
@@ -201,7 +267,7 @@ def run(presence, notify):
         mode = wanted_mode()
         presence.state["mode"] = mode
         if mode == "standby":
-            presence.state.update(sensor_ready=False, present=False, attention=False, distance_mm=None)
+            presence.reset()
             presence.publish()
             log("standby: sensor off")
             wait([notify.fd], None)
@@ -220,7 +286,7 @@ def run(presence, notify):
         except OSError as e:
             # The webcam re-enumerates on USB resets and resume; look again.
             log("sensor %s unavailable: %s" % (os.path.basename(dev), e))
-            presence.state.update(sensor_ready=False)
+            presence.reset()
             presence.publish()
             wait([notify.fd], RETRY_DELAY)
             notify.drain()
@@ -243,7 +309,8 @@ def stream(dev, presence, notify):
     write(dev + "/buffer/length", 16)
     write(dev + "/buffer/enable", 1)
     fd = os.open("/dev/" + name, os.O_RDONLY | os.O_NONBLOCK)
-    presence.state.update(sensor=name, sensor_ready=False)
+    presence.reset()
+    presence.state["sensor"] = name
     presence.publish()
     log("streaming %s at %g Hz" % (name, SAMPLE_HZ))
     try:
@@ -273,6 +340,8 @@ STOPPER_R, STOPPER_W = os.pipe()
 
 def main():
     os.makedirs(CTL_DIR, exist_ok=True)
+    if os.getegid() == 0:
+        log("no Group= set for the service: %s is readable by root only" % STATE_FILE)
     signal.signal(signal.SIGTERM, lambda *_: os.write(STOPPER_W, b"x"))
     signal.signal(signal.SIGINT, lambda *_: os.write(STOPPER_W, b"x"))
     presence = Presence()
@@ -281,8 +350,8 @@ def main():
         run(presence, notify)
     except Stop:
         pass
-    presence.state.update(sensor=None, sensor_ready=False, present=False, attention=False,
-                          distance_mm=None, mode="stopped")
+    presence.reset()
+    presence.state.update(sensor=None, mode="stopped")
     presence.publish()
     log("stopped")
     return 0

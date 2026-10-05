@@ -6,6 +6,8 @@ Reads the state published by the root px13-presence service and, per
   * locks the session after you have been away for `lock_after` seconds,
   * dims the built-in screen after you have looked away for `dim_after`
     seconds and restores it when you look back,
+  * keeps the screen awake (no idle dim, blank or lock) while you are
+    looking at it, by holding a screen-saver inhibition,
   * optionally wakes the screen when you return to a locked session.
 
 It also puts the sensor in standby while the session is locked (unless
@@ -31,11 +33,17 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 
+try:
+    import dbus   # python3-dbus; optional so the pure policy stays testable without it
+except ImportError:
+    dbus = None
+
 STATE_FILE = "/run/px13/presence.json"
 CONFIG_FILE = os.path.expanduser("~/.config/px13/presence.conf")
 AGENT_FILE = os.path.expanduser("~/.cache/px13/presence-agent.json")
-QDBUS = "qdbus6"
+APP_NAME = "PX13 Presence"   # shown in Plasma's battery applet while keeping awake
 INHIBIT_RETRY = 30.0  # seconds before re-checking when an inhibitor blocked an action
+KEEP_AWAKE_GRACE = 30.0  # keep the screen awake this long after you look away
 
 
 # ----------------------------------------------------------------- config ---
@@ -48,6 +56,7 @@ class Config:
     dim: bool = True
     dim_after: int = 10        # seconds looking away (while present) before dimming
     dim_level: int = 30        # percent of maximum brightness
+    keep_awake: bool = True    # no idle dim/blank/lock while you look at the screen
     wake_on_return: bool = False
 
     LIMITS = {"lock_after": (10, 3600), "dim_after": (3, 600), "dim_level": (5, 90)}
@@ -66,7 +75,7 @@ def load_config(path=CONFIG_FILE, log=print):
         return cfg
     sec = parser["presence"]
     values = {}
-    for name in ("enabled", "lock", "dim", "wake_on_return"):
+    for name in ("enabled", "lock", "dim", "keep_awake", "wake_on_return"):
         try:
             values[name] = sec.getboolean(name, fallback=getattr(cfg, name))
         except ValueError:
@@ -103,6 +112,7 @@ class Sensor:
 class Memory:
     """What the agent has already done (so each action happens once)."""
     dimmed: bool = False
+    awake: bool = False                     # holding the keep-awake inhibition
     locked_for_away: float = -1.0          # away_since of the period we locked for
     woke_for_return: bool = False
     sensor_mode: str = ""                   # last mode we requested
@@ -111,7 +121,8 @@ class Memory:
 
 @dataclass
 class Decision:
-    actions: list = field(default_factory=list)   # "lock", "dim", "restore", "wake", "sensor:active|standby"
+    # "lock", "dim", "restore", "wake", "awake:hold|release", "sensor:active|standby"
+    actions: list = field(default_factory=list)
     memory: Memory = Memory()
     wake_at: float = None                          # next time decide() must run, or None
 
@@ -128,7 +139,12 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
         if t > now and (d.wake_at is None or t < d.wake_at):
             d.wake_at = t
 
+    def keep_awake(want):
+        if d.memory.awake != want:
+            act.append("awake:hold" if want else "awake:release"); set_mem(awake=want)
+
     if not cfg.enabled:
+        keep_awake(False)
         if mem.dimmed:
             act.append("restore"); set_mem(dimmed=False)
         if mem.sensor_mode != "standby":
@@ -141,6 +157,7 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
         act.append("sensor:" + want); set_mem(sensor_mode=want)
 
     if locked:
+        keep_awake(False)
         if mem.dimmed:                          # never leave the lock screen dimmed by us
             act.append("restore"); set_mem(dimmed=False)
         if cfg.wake_on_return and sensor.ready:
@@ -152,11 +169,23 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
 
     set_mem(woke_for_return=False)
     if not sensor.ready:
+        keep_awake(False)   # never suppress idle locking on a sensor we cannot read
         if mem.dimmed:
             act.append("restore"); set_mem(dimmed=False)
         return d
 
     blocked = inhibited or now < mem.inhibited_until
+
+    # Keep awake: while you look at the screen (and for a grace period after
+    # you look away) hold an idle inhibition, so Plasma neither dims, blanks
+    # nor idle-locks a screen that is being read. Leaving releases it.
+    if cfg.keep_awake and sensor.present:
+        until = sensor.looking_away_since + KEEP_AWAKE_GRACE
+        keep_awake(sensor.attention or now < until)
+        if not sensor.attention:
+            deadline(until)
+    else:
+        keep_awake(False)
 
     # Adaptive dimming: dim after looking away while present; restore exactly
     # when attention returns. Walking away keeps it dimmed (cheaper) until the
@@ -189,69 +218,90 @@ def decide(now, sensor, locked, cfg, mem, inhibited=False):
 # -------------------------------------------------------------- side effects --
 
 class Session:
-    """Everything that touches the desktop session."""
+    """Everything that touches the desktop session (over one session-bus connection).
 
-    BRIGHTNESS = ("org.kde.ScreenBrightness", "/org/kde/ScreenBrightness/display0")
+    The connection is long-lived on purpose: a screen-saver inhibition lasts
+    only as long as the connection that took it.
+    """
+
+    SCREENSAVER = ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver")
+    BRIGHTNESS = ("org.kde.ScreenBrightness", "/org/kde/ScreenBrightness/display0",
+                  "org.kde.ScreenBrightness.Display")
+    POLICY = ("org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement/PolicyAgent",
+              "org.kde.Solid.PowerManagement.PolicyAgent")
+    TIMEOUT = 5  # seconds per D-Bus call
 
     def __init__(self, log):
         self.log = log
+        self.bus = dbus.SessionBus()
         self.saved_brightness = None
         self.dim_value = None
+        self.inhibit_cookie = None
 
-    def _qdbus(self, *args):
-        r = subprocess.run([QDBUS, *args], capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip() or "qdbus failed")
-        return r.stdout.strip()
+    def _call(self, target, method, *args):
+        service, path, iface = target
+        obj = self.bus.get_object(service, path, introspect=False)
+        return getattr(dbus.Interface(obj, iface), method)(*args, timeout=self.TIMEOUT)
 
-    def _bright_prop(self, name):
-        return int(self._qdbus(*self.BRIGHTNESS, "org.freedesktop.DBus.Properties.Get",
-                               "org.kde.ScreenBrightness.Display", name))
+    def _prop(self, target, name):
+        service, path, iface = target
+        return self._call((service, path, "org.freedesktop.DBus.Properties"), "Get", iface, name)
+
+    def _set_brightness(self, value):
+        self._call(self.BRIGHTNESS, "SetBrightness", dbus.Int32(value),
+                   dbus.UInt32(1))   # flag 1: no on-screen indicator
 
     def locked(self):
         try:
-            return self._qdbus("org.freedesktop.ScreenSaver", "/ScreenSaver",
-                               "org.freedesktop.ScreenSaver.GetActive") == "true"
-        except Exception as e:
+            return bool(self._call(self.SCREENSAVER, "GetActive"))
+        except dbus.DBusException as e:
             self.log("lock state unknown: %s" % e)
             return False
 
     def inhibited(self):
-        """True while something (video, presentation) inhibits idle actions."""
+        """True while something else (video, presentation) inhibits idle actions.
+
+        Our own keep-awake inhibition is excluded, or it would block our dim.
+        """
         try:
-            return self._qdbus("org.freedesktop.PowerManagement.Inhibit",
-                               "/org/freedesktop/PowerManagement/Inhibit",
-                               "org.freedesktop.PowerManagement.Inhibit.HasInhibit") == "true"
-        except Exception:
+            active = self._prop(self.POLICY, "ActiveInhibitions")
+        except dbus.DBusException:
             return False
+        return any(str(entry[1]) != APP_NAME for entry in active)
 
     def apply(self, action, cfg):
         try:
             if action == "lock":
-                self._qdbus("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.Lock")
+                self._call(self.SCREENSAVER, "Lock")
             elif action == "dim":
-                current, maximum = self._bright_prop("Brightness"), self._bright_prop("MaxBrightness")
-                target = maximum * cfg.dim_level // 100
+                current = int(self._prop(self.BRIGHTNESS, "Brightness"))
+                target = int(self._prop(self.BRIGHTNESS, "MaxBrightness")) * cfg.dim_level // 100
                 if current > target:
                     self.saved_brightness, self.dim_value = current, target
-                    self._qdbus(*self.BRIGHTNESS, "org.kde.ScreenBrightness.Display.SetBrightness",
-                                str(target), "1")   # flag 1: no on-screen indicator
+                    self._set_brightness(target)
                 else:
                     self.saved_brightness = None    # already at or below the dim level
             elif action == "restore":
                 if self.saved_brightness is not None:
                     # Only undo our own dim; respect a brightness the user set meanwhile.
-                    if self._bright_prop("Brightness") == self.dim_value:
-                        self._qdbus(*self.BRIGHTNESS, "org.kde.ScreenBrightness.Display.SetBrightness",
-                                    str(self.saved_brightness), "1")
+                    if int(self._prop(self.BRIGHTNESS, "Brightness")) == self.dim_value:
+                        self._set_brightness(self.saved_brightness)
                     self.saved_brightness = self.dim_value = None
+            elif action == "awake:hold":
+                if self.inhibit_cookie is None:
+                    self.inhibit_cookie = int(self._call(
+                        self.SCREENSAVER, "Inhibit", APP_NAME, "You are looking at the screen"))
+            elif action == "awake:release":
+                if self.inhibit_cookie is not None:
+                    cookie, self.inhibit_cookie = self.inhibit_cookie, None
+                    self._call(self.SCREENSAVER, "UnInhibit", dbus.UInt32(cookie))
             elif action == "wake":
                 subprocess.run(["kscreen-doctor", "--dpms", "on"], capture_output=True, timeout=5)
             elif action.startswith("sensor:"):
                 subprocess.run(["sudo", "-n", "/usr/local/bin/px13", "presence", action.split(":")[1]],
                                capture_output=True, timeout=10)
             self.log("action: " + action)
-        except Exception as e:
+        except (dbus.DBusException, subprocess.SubprocessError, OSError, ValueError) as e:
             self.log("action %s failed: %s" % (action, e))
 
 
@@ -295,13 +345,18 @@ def read_state():
 def write_agent_state(data):
     os.makedirs(os.path.dirname(AGENT_FILE), exist_ok=True)
     tmp = AGENT_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(data, f)
     os.replace(tmp, AGENT_FILE)
 
 
 def main():
     log = lambda m: print(m, flush=True)
+    if dbus is None:
+        log("python3-dbus is required (apt install python3-dbus)")
+        return 1
     stop_r, stop_w = os.pipe()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: os.write(stop_w, b"x"))
@@ -338,7 +393,8 @@ def main():
                 session.apply(action, cfg)
             mem = d.memory
 
-            agent = {"locked": locked, "dimmed": mem.dimmed, "sensor_mode": mem.sensor_mode,
+            agent = {"locked": locked, "dimmed": mem.dimmed, "awake": mem.awake,
+                     "sensor_mode": mem.sensor_mode,
                      "config": cfg.__dict__, "inhibited": inhibited,
                      "next_check": d.wake_at}
             if d.actions:
@@ -371,6 +427,8 @@ def main():
     finally:
         if mem.dimmed:
             session.apply("restore", cfg)
+        if mem.awake:
+            session.apply("awake:release", cfg)
         monitor.terminate()
     return 0
 

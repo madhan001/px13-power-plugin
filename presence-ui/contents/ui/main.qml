@@ -317,6 +317,7 @@ PlasmoidItem {
                     PlasmaComponents3.Label {
                         Layout.fillWidth: true
                         text: [root.agent.dimmed ? "Screen dimmed by presence" : "",
+                               root.agent.awake ? "Keeping the screen awake" : "",
                                root.agent.last_action ? "Last: " + root.agent.last_action + " (" + root.ago(root.agent.last_action_at) + ")" : "No actions yet",
                                root.agent.inhibited ? "Paused: an app is inhibiting idle" : ""]
                               .filter(t => t.length > 0).join("  ·  ")
@@ -367,6 +368,13 @@ PlasmoidItem {
                             onValueModified: root.setting("dim_level", value)
                         }
                         PlasmaComponents3.Label { text: "% brightness" }
+
+                        PlasmaComponents3.CheckBox {
+                            Layout.columnSpan: 3
+                            text: "Keep the screen on while I'm looking at it"
+                            checked: root.cfg.keep_awake !== false
+                            onToggled: root.setting("keep_awake", checked)
+                        }
 
                         PlasmaComponents3.CheckBox {
                             Layout.columnSpan: 3

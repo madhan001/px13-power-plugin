@@ -9,6 +9,8 @@ PLASMOID_DIR="${HOME}/.local/share/plasma/plasmoids/org.madhan.px13power"
 PRESENCE_UI_DIR="${HOME}/.local/share/plasma/plasmoids/org.madhan.px13presence"
 USER_UNITS="${HOME}/.config/systemd/user"
 
+python3 -c 'import dbus' 2>/dev/null || { echo "python3-dbus is required: sudo apt install python3-dbus" >&2; exit 1; }
+
 echo "==> System files"
 sudo install -o root -g root -m 755 bin/px13 /usr/local/bin/px13
 sudo install -o root -g root -m 755 bin/px13-envycontrol /usr/local/bin/px13-envycontrol
@@ -18,6 +20,12 @@ sudo install -o root -g root -m 440 system/sudoers-px13-power /etc/sudoers.d/px1
 sudo install -o root -g root -m 755 bin/px13-presence /usr/local/bin/px13-presence
 sudo install -o root -g root -m 644 system/px13-watch.service system/px13-reapply.service system/px13-presence.service /etc/systemd/system/
 sudo install -o root -g root -m 755 system/px13-sleep /usr/lib/systemd/system-sleep/px13
+# The presence state is private: readable only by root and your group.
+PRESENCE_DROPIN=/etc/systemd/system/px13-presence.service.d
+sudo install -d -o root -g root -m 755 "${PRESENCE_DROPIN}"
+printf '[Service]\n# Group that may read /run/px13/presence.json (written by install.sh).\nGroup=%s\n' "$(id -gn)" \
+  | sudo tee "${PRESENCE_DROPIN}/reader-group.conf" >/dev/null
+sudo chmod 644 "${PRESENCE_DROPIN}/reader-group.conf"
 # px13-watch now tracks AC changes itself; remove the old udev trigger.
 sudo rm -f /etc/udev/rules.d/90-px13-ac.rules
 sudo systemctl daemon-reload

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 case "${1:-}" in
-  eco|normal|perf|cycle|reapply|deep-eco|hybrid|optimized)
+  eco|normal|perf|cycle|reapply|deep-eco|deep-eco-close|hybrid|optimized|gpu-users)
     ;;
   *)
-    echo "Usage: px13-panel-run {eco|normal|perf|cycle|reapply|deep-eco|hybrid|optimized}" >&2
+    echo "Usage: px13-panel-run {eco|normal|perf|cycle|reapply|deep-eco|deep-eco-close|hybrid|optimized|gpu-users}" >&2
     exit 2
     ;;
 esac

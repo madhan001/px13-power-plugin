@@ -47,6 +47,18 @@ AC_SINCE_FILE="${RUN_DIR}/ac_since"
 GPU_BUSY_FILE="${RUN_DIR}/gpu_busy"
 OPTIMIZED_SETTLE=10
 
+# GPU Eco switches run the firmware's PCIe routine (ALIB) for the dGPU link.
+# The USB4 host interfaces' runtime suspend (_PS3) uses ALIB too; on
+# 2026-10-15 the two overlapped during a Hybrid switch, ALIB timed out and
+# the SMU stopped responding (hard freeze). So the USB4 interfaces are kept
+# awake during a switch, and switches are spaced at least this far apart.
+GPU_SWITCH_COOLDOWN=30
+GPU_SWITCHED_FILE="${RUN_DIR}/gpu_switched"
+# Stopped automatically before GPU Eco; never listed as apps to close.
+NVIDIA_SERVICES="nvidia-persistenced.service nvidia-powerd.service"
+# Session processes that are never closed for GPU Eco.
+PROTECTED_PROCS="kwin_wayland Xwayland plasmashell systemd systemd-logind"
+
 # mode -> "power-profile stapm_mW slow_mW fast_mW"
 declare -A MODES=(
   [eco]="power-saver 15000 15000 20000"
@@ -56,7 +68,7 @@ declare -A MODES=(
 
 usage() {
   cat <<'EOF'
-Usage: px13 {eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|reapply|check|watch|state}
+Usage: px13 {eco|normal|perf|cycle|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
 
   eco       power-saver, 15W/15W/20W, CO -25, NVIDIA PCI runtime auto
   normal    balanced, 25W/25W/35W, CO -25, NVIDIA PCI runtime auto
@@ -65,6 +77,10 @@ Usage: px13 {eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|reapply|chec
             (changing the power profile elsewhere, e.g. KDE or Fn+F5, switches mode too)
   status    full report: mode, live limits, battery, GPU, RyzenAdj
   deep-eco  firmware GPU Eco on: NVIDIA GPU powered off, live (no reboot)
+  deep-eco-close
+            the same, after closing your apps that use the GPU (TERM, then
+            KILL after 5s)
+  gpu-users list the processes using the NVIDIA GPU ("pid name" per line)
   hybrid    firmware GPU Eco off: NVIDIA GPU back on the bus (first switch from
             EnvyControl integrated rebuilds the driver config, ~3 min)
   optimized GPU follows power: Eco on battery, Hybrid on AC (deep-eco or
@@ -602,20 +618,180 @@ cycle() {
   set_mode "${next}"
 }
 
-# Unload the NVIDIA driver so the firmware can eject the GPU. Fails (and
-# names the holders) if something such as the compositor still uses it.
+# Unload the NVIDIA driver so the firmware can eject the GPU. Fails quietly
+# if something still uses it; nvidia_detach then handles the usual cause.
 nvidia_unload() {
   local mod
   [[ -d /sys/module/nvidia || -d /sys/module/nouveau ]] || return 0
-  systemctl stop nvidia-persistenced.service nvidia-powerd.service >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086  # a list of units
+  systemctl stop ${NVIDIA_SERVICES} >/dev/null 2>&1 || true
   for mod in nvidia_drm nvidia_modeset nvidia_uvm nvidia nouveau; do
     [[ -d "/sys/module/${mod}" ]] && modprobe -r "${mod}" >/dev/null 2>&1 || true
   done
-  if [[ -d /sys/module/nvidia || -d /sys/module/nouveau ]]; then
-    echo "The NVIDIA driver is still in use; close these and try again:" >&2
-    fuser -v /dev/nvidia* /dev/dri/by-path/pci-0000:c4:00.0-* 2>&1 | sed 's/^/  /' >&2 || true
+  [[ ! -d /sys/module/nvidia && ! -d /sys/module/nouveau ]]
+}
+
+# /dev/dri nodes of the dGPU: $1 = card (display) or render.
+nvidia_drm_nodes() {
+  local dev
+  for dev in $(nvidia_devices); do
+    ls "/dev/dri/by-path/pci-${dev}-$1" 2>/dev/null || true
+  done
+}
+
+# "pid name" for each process rendering or computing on the dGPU (the
+# /dev/nvidia* devices and the render node). Holding only the display node,
+# as the compositor does, does not count; neither do the NVIDIA services,
+# which GPU Eco stops itself.
+nvidia_client_pids() {
+  local nodes pid comm
+  nodes="$(ls /dev/nvidia* 2>/dev/null; nvidia_drm_nodes render)"
+  [[ -n "${nodes}" ]] || return 0
+  # shellcheck disable=SC2086  # one argument per node
+  for pid in $(fuser ${nodes} 2>/dev/null | tr -cs '0-9' ' '); do
+    comm="$(ps -o comm= -p "${pid}" 2>/dev/null)" || continue
+    [[ "${comm}" == nvidia-persiste* || "${comm}" == nvidia-powerd ]] && continue
+    printf '%s %s\n' "${pid}" "${comm}"
+  done | sort -un
+}
+
+# Comma-separated names of those processes.
+nvidia_clients() {
+  nvidia_client_pids | awk '{print $2}' | sort -u | paste -sd, -
+}
+
+# The given pids that are still running.
+alive() {
+  local pid
+  for pid in "$@"; do
+    kill -0 "${pid}" 2>/dev/null && echo "${pid}"
+  done
+  return 0
+}
+
+# Close the invoking user's apps that use the dGPU: SIGTERM, then SIGKILL
+# whatever is left after 5s. Refuses (closing nothing) if a session or
+# system process uses it, since closing those would end the session.
+close_gpu_apps() {
+  local uid="${SUDO_UID:-}" pid comm owner i
+  local -a pids=() names=() blocked=()
+  if [[ -z "${uid}" ]]; then
+    echo "Closing GPU apps needs to run through sudo from your session." >&2
     return 1
   fi
+  # shellcheck disable=SC2086  # a list of units
+  systemctl stop ${NVIDIA_SERVICES} >/dev/null 2>&1 || true
+  while read -r pid comm; do
+    owner="$(stat -c %u "/proc/${pid}" 2>/dev/null)" || continue
+    if [[ "${owner}" != "${uid}" || " ${PROTECTED_PROCS} " == *" ${comm} "* ]]; then
+      blocked+=("${comm}")
+    else
+      pids+=("${pid}"); names+=("${comm}")
+    fi
+  done < <(nvidia_client_pids)
+  if ((${#blocked[@]})); then
+    echo "Not closing anything: $(printf '%s\n' "${blocked[@]}" | sort -u | paste -sd, -) uses the GPU and cannot be closed from here." >&2
+    return 1
+  fi
+  ((${#pids[@]})) || return 0
+  echo "Closing $(printf '%s\n' "${names[@]}" | sort -u | paste -sd, -)..."
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  for ((i = 0; i < 10; i++)); do
+    [[ -n "$(alive "${pids[@]}")" ]] || break
+    sleep 0.5
+  done
+  if [[ -n "$(alive "${pids[@]}")" ]]; then
+    # shellcheck disable=SC2046  # one argument per pid
+    kill -KILL $(alive "${pids[@]}") 2>/dev/null || true
+    sleep 1
+  fi
+  if [[ -n "$(nvidia_clients)" ]]; then
+    echo "Still using the GPU: $(nvidia_clients)." >&2
+    return 1
+  fi
+}
+
+# Seconds until another GPU Eco switch is allowed (0 = now).
+gpu_cooldown_left() {
+  local last=0 left
+  read -r last 2>/dev/null < "${GPU_SWITCHED_FILE}" || true
+  left=$(( ${last:-0} + GPU_SWITCH_COOLDOWN - $(date +%s) ))
+  (( left > 0 )) && echo "${left}" || echo 0
+}
+
+gpu_switched_now() {
+  date +%s > "${GPU_SWITCHED_FILE}"
+}
+
+# Keep the USB4 host interfaces awake (see GPU_SWITCH_COOLDOWN); prints the
+# "device control" pairs to restore afterwards.
+usb4_hold() {
+  local dev
+  for dev in /sys/bus/pci/drivers/thunderbolt/0000:*; do
+    [[ -e "${dev}/power/control" ]] || continue
+    printf '%s %s\n' "${dev}" "$(cat "${dev}/power/control")"
+    printf 'on\n' > "${dev}/power/control" 2>/dev/null || true
+  done
+}
+
+usb4_release() {
+  local dev control
+  while read -r dev control; do
+    [[ -n "${dev}" ]] && printf '%s\n' "${control}" > "${dev}/power/control" 2>/dev/null || true
+  done <<< "$1"
+}
+
+# Connected outputs (e.g. HDMI-A-1) driven by the dGPU.
+nvidia_connected_outputs() {
+  local dev conn
+  for dev in $(nvidia_devices); do
+    for conn in /sys/bus/pci/devices/"${dev}"/drm/card*/card*-*; do
+      [[ "$(cat "${conn}/status" 2>/dev/null)" == connected ]] && basename "${conn}" | cut -d- -f2-
+    done
+  done | paste -sd, -
+}
+
+# KWin opens every GPU's display node, including one that appears after login,
+# so in a running session the driver cannot be unloaded. Unbinding the GPU
+# from the driver works instead: nvidia_modeset_remove() unplugs the DRM device
+# (drm_dev_unplug) before the driver waits for its remaining users (595.91,
+# nv_pci_remove_helper), and KWin then drops the GPU. That wait is
+# uninterruptible, so only unbind when nothing renders or computes on the GPU,
+# and do it in the background with a deadline.
+nvidia_detach() {
+  local clients outputs dev pid i
+  clients="$(nvidia_clients)"
+  if [[ -n "${clients}" ]]; then
+    echo "The NVIDIA GPU is in use by ${clients}; close them and try again." >&2
+    return 1
+  fi
+  outputs="$(nvidia_connected_outputs)"
+  if [[ -n "${outputs}" ]]; then
+    echo "A display is connected to the NVIDIA GPU (${outputs}); unplug it and try again." >&2
+    return 1
+  fi
+  for dev in $(nvidia_devices); do
+    [[ -e "/sys/bus/pci/devices/${dev}/driver" ]] || continue
+    # Wake it first: tearing down the display engine of a runtime-suspended
+    # GPU logs hundreds of Xid 56 errors.
+    printf 'on\n' > "/sys/bus/pci/devices/${dev}/power/control" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do
+      [[ "$(cat "/sys/bus/pci/devices/${dev}/power/runtime_status" 2>/dev/null)" == active ]] && break
+      sleep 0.1
+    done
+    printf '%s\n' "${dev}" > "/sys/bus/pci/devices/${dev}/driver/unbind" &
+    pid=$!
+    for ((i = 0; i < 30; i++)); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      # It completes on its own once the last user lets go.
+      echo "The NVIDIA driver is still waiting for the GPU to be released; try again shortly." >&2
+      return 1
+    fi
+    wait "${pid}" || true
+  done
 }
 
 gpu_eco_on() {
@@ -624,7 +800,7 @@ gpu_eco_on() {
     echo "GPU Eco is already on: NVIDIA GPU is powered off by firmware."
     return 0
   fi
-  nvidia_unload || return 1
+  nvidia_unload || nvidia_detach || return 1
   # Remaining functions (HDMI audio) are unbound so the eject is clean.
   for dev in $(nvidia_functions); do
     if [[ -e "/sys/bus/pci/devices/${dev}/driver" ]]; then
@@ -632,8 +808,12 @@ gpu_eco_on() {
     fi
   done
   echo "Turning GPU Eco on (firmware ejects and powers off the NVIDIA GPU)..."
+  local held
+  held="$(usb4_hold)"
   rc="$(wmi_devs "${WMI_GPU_ECO}" 1)"
   sleep 1
+  usb4_release "${held}"
+  gpu_switched_now
   if [[ "$(gpu_eco_state)" != on || -n "$(nvidia_functions)" ]]; then
     echo "GPU Eco did not complete (firmware returned ${rc}); GPU is still on." >&2
     return 1
@@ -656,7 +836,8 @@ gpu_eco_off() {
   # ~20s for the PCIe link. Linux only brings the link up on a root-port
   # rescan, so rescan while the firmware is still waiting: the call then
   # returns 1 within ~1s instead of timing out with 2 (measured: 1.7s total).
-  local out pid
+  local out pid held
+  held="$(usb4_hold)"
   out="$(mktemp "${RUN_DIR}/eco-off.XXXXXX")"
   wmi_devs "${WMI_GPU_ECO}" 0 > "${out}" &
   pid=$!
@@ -668,6 +849,8 @@ gpu_eco_off() {
     sleep 0.5
   done
   wait "${pid}" || true
+  usb4_release "${held}"
+  gpu_switched_now
   rc="$(cat "${out}")"
   rm -f "${out}"
   if [[ "$(gpu_eco_state)" != off ]]; then
@@ -701,12 +884,9 @@ write_gpu_policy() {
   chmod 644 "${GPU_POLICY_FILE}"
 }
 
-# Comma-separated names of processes holding the NVIDIA GPU open.
+# Comma-separated names of processes keeping the GPU from switching off.
 nvidia_holders() {
-  local pid
-  for pid in $(fuser /dev/nvidia* /dev/dri/by-path/pci-0000:c4:00.0-* 2>/dev/null); do
-    ps -o comm= -p "${pid}" 2>/dev/null || true
-  done | sort -u | paste -sd, -
+  nvidia_clients
 }
 
 # Enforce the optimized policy; caller holds the px13 lock.
@@ -718,6 +898,7 @@ optimized_apply() {
   fi
   read -r since 2>/dev/null < "${AC_SINCE_FILE}" || true
   (( $(date +%s) - ${since:-0} >= OPTIMIZED_SETTLE )) || return 0
+  (( $(gpu_cooldown_left) == 0 )) || return 0   # retried at the next check
   eco="$(gpu_eco_state)"
   if ! on_ac && [[ "${eco}" == off ]]; then
     if gpu_eco_on >/dev/null 2>&1; then
@@ -762,6 +943,16 @@ optimized() {
   fi
 }
 
+# Refuse a GPU switch too soon after the previous one (see GPU_SWITCH_COOLDOWN).
+gpu_cooldown_check() {
+  local left
+  left="$(gpu_cooldown_left)"
+  if (( left > 0 )); then
+    echo "The GPU switched moments ago; try again in ${left}s." >&2
+    return 1
+  fi
+}
+
 deep_eco() {
   with_lock
   write_gpu_policy manual
@@ -771,6 +962,12 @@ deep_eco() {
     return 1
   fi
   local rc=0
+  if [[ "$(gpu_eco_state)" != on ]]; then
+    gpu_cooldown_check || return 1
+    if [[ "${1:-}" == close ]]; then
+      close_gpu_apps || { publish_state; return 1; }
+    fi
+  fi
   gpu_eco_on || rc=$?
   publish_state
   return "${rc}"
@@ -785,6 +982,9 @@ hybrid() {
     return 1
   fi
   local rc=0
+  if [[ "$(gpu_eco_state)" != off || -z "$(nvidia_devices)" ]]; then
+    gpu_cooldown_check || return 1
+  fi
   if [[ "$(gpu_config)" == integrated ]]; then
     if [[ ! -x "${ENVYCONTROL}" || ! -x "${ENVYCONTROL_HELPER}" ]]; then
       echo "EnvyControl integrated mode is set but EnvyControl is not usable." >&2
@@ -851,7 +1051,7 @@ status() {
 
 cmd="${1:-}"
 case "${cmd}" in
-  eco|normal|perf|cycle|status|deep-eco|hybrid|optimized|reapply|check|watch|state) ;;
+  eco|normal|perf|cycle|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state) ;;
   *) usage; exit 1 ;;
 esac
 
@@ -884,6 +1084,8 @@ case "${cmd}" in
   cycle) cycle ;;
   status) status ;;
   deep-eco) deep_eco ;;
+  deep-eco-close) deep_eco close ;;
+  gpu-users) nvidia_client_pids ;;
   hybrid) hybrid ;;
   optimized) optimized ;;
   reapply) reapply ;;

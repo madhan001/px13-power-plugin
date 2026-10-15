@@ -19,6 +19,10 @@ PlasmoidItem {
 
     readonly property string binDir: "/home/madhan/.local/bin/"
     readonly property string statusCommand: binDir + "px13-panel-status"
+    readonly property string gpuUsersCommand: binDir + "px13-panel-run gpu-users"
+    // Apps using the NVIDIA GPU ([{pid, name}]), fetched when GPU Eco is chosen.
+    property var gpuUsers: []
+    property bool gpuUsersLoaded: false
 
     readonly property string mode: px.mode || "unknown"
     readonly property bool drifted: px.applied === "drifted"
@@ -133,6 +137,19 @@ PlasmoidItem {
         runCommand(binDir + "px13-panel-battery limit " + pct, "Setting charge limit");
     }
 
+    function refreshGpuUsers() {
+        gpuUsersLoaded = false;
+        commandRunner.disconnectSource(gpuUsersCommand);
+        commandRunner.connectSource(gpuUsersCommand);
+    }
+
+    function gpuUsersText() {
+        return gpuUsers.map(u => u.name + " (" + u.pid + ")").join(", ");
+    }
+
+    // GPU Eco was chosen: list what uses the GPU before asking to confirm.
+    onPendingGpuChanged: if (pendingGpu === 0) refreshGpuUsers()
+
     function refreshStatus() {
         commandRunner.disconnectSource(statusCommand);
         commandRunner.connectSource(statusCommand);
@@ -184,6 +201,14 @@ PlasmoidItem {
 
             if (sourceName === root.statusCommand) {
                 root.parseStatus((data["stdout"] || "").toString());
+                return;
+            }
+            if (sourceName === root.gpuUsersCommand) {
+                root.gpuUsers = (data["stdout"] || "").toString().split("\n")
+                    .map(l => l.trim().split(/\s+/))
+                    .filter(f => f.length === 2 && /^[0-9]+$/.test(f[0]))
+                    .map(f => ({ pid: f[0], name: f[1] }));
+                root.gpuUsersLoaded = true;
                 return;
             }
             root.commandBusy = false;
@@ -244,7 +269,7 @@ PlasmoidItem {
     readonly property var gpuChoices: [
         { action: "deep-eco", label: "GPU Eco",
           question: "Power off the NVIDIA GPU?",
-          detail: "The firmware cuts its power. Apps using it must be closed first." },
+          detail: "The firmware cuts its power. No apps are using it." },
         { action: "hybrid", label: "Hybrid",
           question: "Power on the NVIDIA GPU?",
           detail: "Takes a couple of seconds. It sleeps by itself when idle." },
@@ -596,19 +621,30 @@ PlasmoidItem {
             }
 
             Kirigami.InlineMessage {
+                id: gpuConfirm
                 Layout.fillWidth: true
+                // GPU Eco with apps on the GPU: offer to close them.
+                readonly property bool appsInUse: root.pendingGpu === 0 && root.gpuUsers.length > 0
                 visible: root.pendingGpu >= 0
-                type: Kirigami.MessageType.Information
-                text: root.pendingGpu >= 0
-                      ? "<b>" + root.gpuChoices[root.pendingGpu].question + "</b><br>"
-                        + root.gpuChoices[root.pendingGpu].detail
-                      : ""
+                type: appsInUse ? Kirigami.MessageType.Warning : Kirigami.MessageType.Information
+                text: root.pendingGpu < 0 ? ""
+                      : appsInUse
+                        ? "<b>" + root.gpuChoices[0].question + "</b><br>In use by "
+                          + root.gpuUsersText() + ". They will be asked to quit (unsaved work may be lost); "
+                          + "any still running after 5 s are closed."
+                        : "<b>" + root.gpuChoices[root.pendingGpu].question + "</b><br>"
+                          + (root.pendingGpu === 0 && !root.gpuUsersLoaded ? "Checking for apps using the GPU…"
+                             : root.gpuChoices[root.pendingGpu].detail)
                 actions: [
                     Kirigami.Action {
-                        text: "Apply"
-                        icon.name: "dialog-ok-apply"
+                        text: gpuConfirm.appsInUse ? "Close Apps and Switch" : "Apply"
+                        icon.name: gpuConfirm.appsInUse ? "process-stop" : "dialog-ok-apply"
+                        enabled: root.pendingGpu !== 0 || root.gpuUsersLoaded
                         onTriggered: {
-                            const action = root.gpuChoices[root.pendingGpu].action;
+                            let action = root.gpuChoices[root.pendingGpu].action;
+                            if (gpuConfirm.appsInUse) {
+                                action = "deep-eco-close";
+                            }
                             root.pendingGpu = -1;
                             root.runAction(action);
                         }

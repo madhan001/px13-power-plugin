@@ -60,21 +60,38 @@ NVIDIA_SERVICES="nvidia-persistenced.service nvidia-powerd.service"
 PROTECTED_PROCS="kwin_wayland Xwayland plasmashell systemd systemd-logind"
 
 # mode -> "power-profile stapm_mW slow_mW fast_mW"
+# eco: 15 W sustained sits on the measured energy-per-task optimum (8-20 W).
+# perf: the EC ceilings on AC ("unleashed"); battery clamps to 56/65/85.
 declare -A MODES=(
   [eco]="power-saver 15000 15000 20000"
   [normal]="balanced 25000 25000 35000"
-  [perf]="performance 70000 70000 80000"
+  [perf]="performance 65000 70000 85000"
 )
+# EPP per mode, set after power-profiles-daemon applies the profile (empty:
+# keep the daemon's choice). power-saver's "power" made 15 ms bursts 36%
+# slower than balance_power with no measurable energy saving (px13-sweep).
+declare -A MODE_EPP=(
+  [eco]="balance_power"
+)
+
+# CPU mode follows the power source: perf on AC, eco on battery. A manual
+# choice holds until the next plug/unplug. "px13 auto off" disables it.
+CPU_POLICY_FILE="${STATE_DIR}/cpu_policy"
+# AC state (0/1) the auto policy last acted on; /run, so boot decides afresh.
+CPU_AUTO_AC_FILE="${RUN_DIR}/cpu_auto_ac"
 
 usage() {
   cat <<'EOF'
-Usage: px13 {eco|normal|perf|cycle|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
+Usage: px13 {eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
 
-  eco       power-saver, 15W/15W/20W, CO -25, NVIDIA PCI runtime auto
+  eco       power-saver, 15W/15W/20W, EPP balance_power, CO -25, NVIDIA PCI runtime auto
   normal    balanced, 25W/25W/35W, CO -25, NVIDIA PCI runtime auto
-  perf      performance, 70W/70W/80W request (EC caps at 65/70/85 on AC, 56/65/85 on battery), CO -25
+  perf      performance, the EC ceilings: 65W/70W/85W on AC (56/65/85 on battery), CO -25
   cycle     eco -> normal -> perf -> eco
             (changing the power profile elsewhere, e.g. KDE or Fn+F5, switches mode too)
+  auto [on|off]
+            CPU mode follows power (default on): perf on AC, eco on battery;
+            a manual mode choice holds until the next plug/unplug
   status    full report: mode, live limits, battery, GPU, RyzenAdj
   deep-eco  firmware GPU Eco on: NVIDIA GPU powered off, live (no reboot)
   deep-eco-close
@@ -298,6 +315,9 @@ publish_state() {
     printf 'profile=%s\n' "$(current_profile)"
     printf 'expected_profile=%s\n' "$(mode_profile "${mode}")"
     printf 'limits=%s\n' "${limits:-unknown}"
+    printf 'cpu_clamped=%s\n' "$(pstate_clamped && echo yes || echo no)"
+    printf 'epp=%s\n' "$(current_epp)"
+    printf 'cpu_policy=%s\n' "$(cpu_policy)"
     printf 'applied=%s\n' "${applied}"
     printf 'limit_path=%s\n' "$(ec_available && echo ec || echo ryzenadj)"
     printf 'gpu_config=%s\n' "${gpu_cfg}"
@@ -419,8 +439,85 @@ wait_for_firmware() {
   done
 }
 
+current_epp() {
+  local e=""
+  read -r e 2>/dev/null < /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference || true
+  printf '%s\n' "${e}"
+}
+
+# Sets the mode's EPP on every CPU if it has one and differs; logs on change.
+apply_mode_epp() {
+  local want="${MODE_EPP[$1]:-}" f
+  [[ -n "${want}" && "$(current_epp)" != "${want}" ]] || return 0
+  for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+    printf '%s\n' "${want}" > "${f}" 2>/dev/null || true
+  done
+  log "EPP set to ${want} for $1."
+}
+
+cpu_policy() {
+  local policy=""
+  read -r policy 2>/dev/null < "${CPU_POLICY_FILE}" || true
+  [[ "${policy}" == manual ]] && echo manual || echo auto
+}
+
+# Auto policy: once per power-source change, switch to perf on AC and eco on
+# battery. Caller holds the px13 lock.
+cpu_auto_apply() {
+  local ac=0 last="" mode power=battery
+  [[ "$(cpu_policy)" == auto ]] || return 0
+  on_ac && { ac=1; power=AC; }
+  read -r last 2>/dev/null < "${CPU_AUTO_AC_FILE}" || true
+  [[ "${last}" != "${ac}" ]] || return 0
+  printf '%s\n' "${ac}" > "${CPU_AUTO_AC_FILE}"
+  if ((ac)); then mode=perf; else mode=eco; fi
+  [[ "$(stored_mode)" == "${mode}" && "$(current_profile)" == "$(mode_profile "${mode}")" ]] && return 0
+  log "Auto: on ${power}, switching to ${mode}."
+  write_mode "${mode}"
+  apply_mode "${mode}" || true
+  if [[ "${mode}" != perf ]]; then
+    set_nvidia_auto
+  fi
+}
+
+auto_cmd() {
+  case "${1:-on}" in
+    on)
+      with_lock
+      printf 'auto\n' > "${CPU_POLICY_FILE}"
+      rm -f "${CPU_AUTO_AC_FILE}"
+      cpu_auto_apply
+      publish_state
+      echo "Auto mode on: perf on AC, eco on battery. Now in $(stored_mode)."
+      ;;
+    off)
+      install -d -m 755 "${STATE_DIR}"
+      printf 'manual\n' > "${CPU_POLICY_FILE}"
+      publish_state
+      echo "Auto mode off: the mode only changes when you pick one."
+      ;;
+    *) echo "Usage: px13 auto [on|off]" >&2; return 1 ;;
+  esac
+}
+
 # apply_mode <mode>; returns 0 if the limits verified.
 apply_mode() {
+  local rc=0 changed=0 i
+  [[ "$(current_profile)" != "$(mode_profile "$1")" ]] && changed=1
+  apply_mode_limits "$1" || rc=$?
+  apply_mode_epp "$1"
+  if ((changed)); then
+    # A profile change can re-trigger the amd_pstate clamp a moment later.
+    for i in 1 2 3 4; do
+      pstate_clamped && break
+      sleep 0.5
+    done
+    pstate_unclamp
+  fi
+  return "${rc}"
+}
+
+apply_mode_limits() {
   local mode="$1" profile stapm slow fast attempt
   read -r profile stapm slow fast <<< "${MODES[$mode]}"
 
@@ -518,9 +615,59 @@ set_mode() {
   return "${rc}"
 }
 
+# amd_pstate on this chip can come up at boot, or fall back after a platform
+# profile change or resume, with every core held at the 2.0 GHz nominal clock:
+# cpuinfo/scaling max read the nominal frequency while amd_pstate_max_freq
+# still reports the boost clock. Re-registering the driver (guided, then
+# active) clears it. Seen with asusd + power-profiles-daemon on HX 370 boards.
+PSTATE_STATUS="/sys/devices/system/cpu/amd_pstate/status"
+PSTATE_FAIL_STAMP="${RUN_DIR}/pstate_fail"
+# After a fix that did not clear the clamp, wait this long before retrying.
+PSTATE_RETRY=600
+
+pstate_clamped() {
+  local pol hw cap scaling nominal
+  read -r nominal < /sys/devices/system/cpu/cpu0/acpi_cppc/nominal_freq 2>/dev/null || return 1
+  for pol in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+    read -r hw < "${pol}/amd_pstate_max_freq" 2>/dev/null || return 1
+    read -r cap < "${pol}/cpuinfo_max_freq" 2>/dev/null || return 1
+    read -r scaling < "${pol}/scaling_max_freq" 2>/dev/null || return 1
+    ((scaling < cap)) && cap="${scaling}"
+    ((cap < hw && cap == nominal * 1000)) && return 0
+  done
+  return 1
+}
+
+pstate_unclamp() {
+  local now last gov epp pol
+  [[ -w "${PSTATE_STATUS}" ]] && pstate_clamped || return 0
+  now="$(date +%s)"
+  last="$(cat "${PSTATE_FAIL_STAMP}" 2>/dev/null || echo 0)"
+  ((now - last >= PSTATE_RETRY)) || return 0
+  read -r gov < /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+  read -r epp < /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference
+  log "amd_pstate is clamped to the nominal clock; re-registering the driver."
+  echo guided > "${PSTATE_STATUS}" || true
+  sleep 1
+  echo active > "${PSTATE_STATUS}" || true
+  # Re-registering resets governor and EPP; put back what the profile chose.
+  for pol in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+    echo "${gov}" > "${pol}/scaling_governor" 2>/dev/null || true
+    echo "${epp}" > "${pol}/energy_performance_preference" 2>/dev/null || true
+  done
+  if pstate_clamped; then
+    log "amd_pstate is still clamped; retrying in ${PSTATE_RETRY}s."
+    install -d -m 755 "${RUN_DIR}"
+    echo "${now}" > "${PSTATE_FAIL_STAMP}"
+  else
+    log "amd_pstate clamp cleared (governor ${gov}, EPP ${epp})."
+  fi
+}
+
 reapply() {
   local mode
   with_lock
+  pstate_unclamp
   mode="$(stored_mode)"
   if ! valid_mode "${mode}"; then
     publish_state
@@ -544,6 +691,7 @@ check() {
   install -d -m 755 "${RUN_DIR}"
   exec 9> "${LOCK_FILE}"
   flock -n 9 || return 0
+  pstate_unclamp
   mode="$(stored_mode)"
   profile="$(current_profile)"
   adopted="$(profile_mode "${profile}")"
@@ -561,7 +709,10 @@ check() {
       log "Firmware overrode ${mode} limits (${limits} W); re-applying."
       apply_mode "${mode}" || true
     fi
+    # power-profiles-daemon rewrites EPP on its own events (AC changes).
+    apply_mode_epp "${mode}"
   fi
+  cpu_auto_apply
   optimized_apply
   publish_state
   exec 9>&-
@@ -1026,7 +1177,7 @@ status() {
   publish_state
 
   echo "Mode:           ${mode}"
-  echo "Power profile:  $(current_profile)"
+  echo "Power profile:  $(current_profile), EPP $(current_epp), auto mode $(cpu_policy)"
   echo "Live limits:    $(tr ' ' '/' <<< "${limits:-unknown}") W (STAPM/slow/fast)"
   echo "Applied:        $(sed -n 's/^applied=//p' "${LIVE_FILE}")"
   echo "Battery:        $(battery_report)"
@@ -1051,7 +1202,7 @@ status() {
 
 cmd="${1:-}"
 case "${cmd}" in
-  eco|normal|perf|cycle|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state) ;;
+  eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state) ;;
   *) usage; exit 1 ;;
 esac
 
@@ -1082,6 +1233,7 @@ fi
 case "${cmd}" in
   eco|normal|perf) set_mode "${cmd}" ;;
   cycle) cycle ;;
+  auto) auto_cmd "${2:-on}" ;;
   status) status ;;
   deep-eco) deep_eco ;;
   deep-eco-close) deep_eco close ;;

@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+"""Measure what the PX13's Ryzen AI 9 HX 370 really does, to tune it.
+
+Run as root (RAPL, RyzenAdj and cpufreq writes): sudo px13-sweep --phase co
+
+Phases (default: all; --quick shortens every run):
+  co     is the Curve Optimizer offset doing anything, and is it stable?
+         Same all-thread load at the same power limit with CO 0 vs the
+         offset px13 applies, ABBA order, result-checked per iteration.
+  curve  single-core frequency sweep, Zen 5 and Zen 5c, limits opened up:
+         where the efficiency knee is.
+  limits all-thread throughput vs power limit (12 and 24 threads): what
+         each extra watt buys, to pick the eco/normal/perf limits.
+  epp    repeated UI-burst runs per EPP with paired statistics (--reps, --window).
+  soak   time series of power, Tctl and fan RPM under a load (--load, --duration,
+         --soak-limits, --fan-curve); for fan and fanless tuning.
+  race   fixed time window incl. the idle tail, frequency cap x EPP, for a
+         UI-like burst pattern and a sprint pattern: energy vs latency, with
+         the Pareto-optimal settings marked.
+
+The px13 watcher is stopped for the run (it would re-apply limits and CO)
+and everything is restored afterwards, also on Ctrl-C. Results go to
+~/px13-sweep/<timestamp>/*.csv. The workload is SHA-256 on a 256 KiB buffer
+(SHA-NI, cache resident): a steady integer load, lighter than AVX-512 or
+memory-bound work, so treat absolute watts as a lower bound.
+"""
+import argparse
+import atexit
+import csv
+import hashlib
+import multiprocessing as mp
+import os
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CPU = Path("/sys/devices/system/cpu")
+RAPL = Path("/sys/class/powercap/intel-rapl:0")
+BAT = Path("/sys/class/power_supply/BAT0")
+AC = Path("/sys/class/power_supply/AC0/online")
+RYZENADJ = "/usr/local/bin/ryzenadj"
+PX13 = "/usr/local/bin/px13"
+BUF = bytes(range(256)) * 1024
+REF = hashlib.sha256(BUF).digest()
+BUF_MB = len(BUF) / 1e6
+CO_PX13 = -25
+
+
+def rd(path):
+    return Path(path).read_text().strip()
+
+
+def wr(path, value):
+    Path(path).write_text(str(value))
+
+
+def sh(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- hardware
+
+def cpus():
+    return sorted(int(p.name[3:]) for p in CPU.glob("cpu[0-9]*") if (p / "cpufreq").is_dir())
+
+
+def pol(c):
+    return CPU / f"cpu{c}/cpufreq"
+
+
+def siblings(c):
+    return [int(x) for x in rd(CPU / f"cpu{c}/topology/thread_siblings_list").replace("-", ",").split(",")]
+
+
+def primary_threads():
+    out = []
+    for c in cpus():
+        first = int(rd(CPU / f"cpu{c}/topology/thread_siblings_list").replace("-", ",").split(",")[0])
+        if first == c:
+            out.append(c)
+    return out
+
+
+def core_classes():
+    """(zen5_cpu, zen5c_cpu): the first primary thread of each class."""
+    perf = {c: int(rd(pol(c) / "amd_pstate_highest_perf")) for c in primary_threads()}
+    big = max(perf.values())
+    z5 = [c for c, p in perf.items() if p > 0.8 * big]
+    z5c = [c for c, p in perf.items() if p <= 0.8 * big]
+    return z5[0], (z5c[0] if z5c else None)
+
+
+def hw_max_khz(c):
+    return int(rd(pol(c) / "amd_pstate_max_freq"))
+
+
+def hw_min_khz():
+    return int(rd(pol(cpus()[0]) / "cpuinfo_min_freq"))
+
+
+def tctl():
+    for h in Path("/sys/class/hwmon").glob("hwmon*"):
+        if rd(h / "name") == "k10temp":
+            return int(rd(h / "temp1_input")) / 1000
+    return float("nan")
+
+
+def on_ac():
+    try:
+        return rd(AC) == "1"
+    except OSError:
+        return False
+
+
+def battery_w():
+    try:
+        if rd(BAT / "status") != "Discharging":
+            return float("nan")
+        return int(rd(BAT / "power_now")) / 1e6
+    except (OSError, ValueError):
+        return float("nan")
+
+
+def read_energy():
+    return (int(rd(RAPL / "energy_uj")), int(rd(RAPL / "intel-rapl:0:0/energy_uj")))
+
+
+RANGE = int(rd(RAPL / "max_energy_range_uj"))
+
+
+def joules(a, b):
+    return ((b - a) % RANGE) / 1e6
+
+
+def read_limits():
+    """(stapm, slow, fast) in W as the SMU reports them."""
+    out = sh(RYZENADJ, "-i").stdout
+    try:
+        g = lambda n: float(re.search(rf"\|\s*{n}\s*\|\s*([\d.]+)", out).group(1))
+        return g("STAPM LIMIT"), g("PPT LIMIT SLOW"), g("PPT LIMIT FAST")
+    except AttributeError:
+        return (float("nan"),) * 3
+
+
+def set_limits(w):
+    mw = int(w * 1000)
+    sh(RYZENADJ, f"--stapm-limit={mw}", f"--slow-limit={mw}", f"--fast-limit={mw}")
+    time.sleep(1.0)
+    return read_limits()
+
+
+def set_limits3(stapm, slow, fast):
+    sh(RYZENADJ, f"--stapm-limit={int(stapm * 1000)}", f"--slow-limit={int(slow * 1000)}",
+       f"--fast-limit={int(fast * 1000)}")
+    time.sleep(1.0)
+    return read_limits()
+
+
+FAN_HWMON = next((h for h in Path("/sys/class/hwmon").glob("hwmon*") if rd(h / "name") == "asus"), None)
+ASUS_PROFILE = {"quiet": "Quiet", "balanced": "Balanced", "performance": "Performance"}
+
+
+def fan_rpm():
+    if FAN_HWMON is None:
+        return float("nan"), float("nan")
+    return tuple(int(rd(FAN_HWMON / f"fan{i}_input")) for i in (1, 2))
+
+
+def set_fan_curve(saved, data):
+    """Custom curve for both fans on the active profile ("48c:0%,...", 8 points)."""
+    prof = ASUS_PROFILE[rd("/sys/firmware/acpi/platform_profile")]
+    for fan in ("cpu", "gpu"):
+        r = sh("asusctl", "fan-curve", "--mod-profile", prof, "--fan", fan, "--data", data)
+        if r.returncode:
+            sys.exit(f"asusctl refused the {fan} curve: {r.stdout}{r.stderr}")
+    sh("asusctl", "fan-curve", "--mod-profile", prof, "--enable-fan-curves", "true")
+    saved.fan_profile = prof
+    time.sleep(1.0)
+
+
+def co_value(n):
+    return n if n >= 0 else 0x100000 + n
+
+
+def set_co(n):
+    r = sh(RYZENADJ, f"--set-coall={co_value(n)}")
+    if "Successfully set coall" not in r.stdout + r.stderr:
+        sys.exit(f"RyzenAdj refused CO {n}: {r.stdout}{r.stderr}")
+    time.sleep(0.5)
+
+
+def set_range(which, lo_khz, hi_khz):
+    for c in which:
+        p = pol(c)
+        wr(p / "scaling_min_freq", hw_min_khz())  # always <= any new max
+        wr(p / "scaling_max_freq", hi_khz)
+        wr(p / "scaling_min_freq", lo_khz)
+
+
+def set_epp(epp):
+    for c in cpus():
+        wr(pol(c) / "energy_performance_preference", epp)
+
+
+def cooldown(target=68, maxwait=45):
+    t0 = time.time()
+    while tctl() > target and time.time() - t0 < maxwait:
+        time.sleep(3)
+
+
+# ----------------------------------------------------------------- restore
+
+class Saved:
+    def __init__(self):
+        self.cpu = {c: {k: rd(pol(c) / k) for k in (
+            "scaling_governor", "energy_performance_preference",
+            "scaling_min_freq", "scaling_max_freq")} for c in cpus()}
+        self.watch = sh("systemctl", "is-active", "px13-watch").stdout.strip() == "active"
+        self.fan_profile = None
+        self.done = False
+
+    def restore(self):
+        if self.done:
+            return
+        self.done = True
+        for c, v in self.cpu.items():
+            p = pol(c)
+            for k in ("scaling_min_freq", ):
+                wr(p / k, hw_min_khz())
+            for k in ("scaling_max_freq", "scaling_min_freq", "scaling_governor",
+                      "energy_performance_preference"):
+                try:
+                    wr(p / k, v[k])
+                except OSError:
+                    pass
+        if self.fan_profile:
+            sh("asusctl", "fan-curve", "--mod-profile", self.fan_profile, "--enable-fan-curves", "false")
+            say(f"Stock fan curve restored for {self.fan_profile}.")
+        # px13 re-applies the stored mode (limits and CO) on start / reapply.
+        if self.watch:
+            sh("systemctl", "start", "px13-watch")
+        else:
+            sh(PX13, "reapply")
+        say("\nRestored cpufreq settings and px13 mode.")
+
+
+# ---------------------------------------------------------------- workload
+
+def worker(idx, cpu, counters, errors, stop):
+    os.sched_setaffinity(0, {cpu})
+    h = hashlib.sha256
+    n = bad = 0
+    while not stop.is_set():
+        for _ in range(64):
+            if h(BUF).digest() != REF:
+                bad += 1
+            n += 1
+        counters[idx] = n
+        errors[idx] = bad
+
+
+def gated_worker(idx, cpu, counters, errors, stop, go):
+    os.sched_setaffinity(0, {cpu})
+    h = hashlib.sha256
+    n = bad = 0
+    while not stop.is_set():
+        if not go.value:
+            time.sleep(0.005)
+            continue
+        for _ in range(16):
+            if h(BUF).digest() != REF:
+                bad += 1
+            n += 1
+        counters[idx] = n
+        errors[idx] = bad
+
+
+def run_load(which, seconds, warmup):
+    """All of `which` busy; returns the measurement over `seconds`."""
+    n = len(which)
+    counters = mp.Array("Q", n, lock=False)
+    errors = mp.Array("Q", n, lock=False)
+    stop = mp.Event()
+    procs = [mp.Process(target=worker, args=(i, c, counters, errors, stop))
+             for i, c in enumerate(which)]
+    for p in procs:
+        p.daemon = True  # a Ctrl-C mid-run must not hang on join
+        p.start()
+    time.sleep(warmup)
+    lim0 = read_limits()
+    e0, t0, n0 = read_energy(), time.monotonic(), sum(counters)
+    mhz, bat, temps = [], [], []
+    while time.monotonic() - t0 < seconds:
+        time.sleep(0.25)
+        mhz.append(sum(int(rd(pol(c) / "scaling_cur_freq")) for c in which) / n / 1000)
+        bat.append(battery_w())
+        temps.append(tctl())
+    e1, t1, n1 = read_energy(), time.monotonic(), sum(counters)
+    lim1 = read_limits()
+    stop.set()
+    for p in procs:
+        p.join()
+    dt = t1 - t0
+    bats = [b for b in bat if b == b]
+    return {
+        "mbps": (n1 - n0) * BUF_MB / dt,
+        "mhz": sum(mhz) / len(mhz),
+        "pkg_w": joules(e0[0], e1[0]) / dt,
+        "core_w": joules(e0[1], e1[1]) / dt,
+        "bat_w": sum(bats) / len(bats) if bats else float("nan"),
+        "tctl": max(temps),
+        "errors": sum(errors),
+        "stapm_w": lim1[0],
+        "drift": int(any(abs(a - b) > 0.6 for a, b in zip(lim0, lim1))),
+    }
+
+
+def run_idle(seconds):
+    e0, t0 = read_energy(), time.monotonic()
+    time.sleep(seconds)
+    e1, t1 = read_energy(), time.monotonic()
+    return joules(e0[0], e1[0]) / (t1 - t0), joules(e0[1], e1[1]) / (t1 - t0)
+
+
+def calibrate(cpu):
+    """Iterations per second of one core at the current settings."""
+    os.sched_setaffinity(0, {cpu})
+    end = time.monotonic() + 2.0
+    n = 0
+    while time.monotonic() < end:
+        hashlib.sha256(BUF).digest()
+        n += 1
+    os.sched_setaffinity(0, set(cpus()))
+    return n / 2.0
+
+
+def burst(cpu, chunk_iters, period, window):
+    """chunk_iters of work every `period` s for `window` s on one core."""
+    os.sched_setaffinity(0, {cpu})
+    lat, missed, bad = [], 0, 0
+    e0 = read_energy()
+    bats = []
+    t0 = time.monotonic()
+    nxt, last_bat = t0, t0
+    while True:
+        now = time.monotonic()
+        if now - t0 >= window:
+            break
+        for _ in range(chunk_iters):
+            if hashlib.sha256(BUF).digest() != REF:
+                bad += 1
+        done = time.monotonic()
+        lat.append(done - now)
+        nxt += period
+        if done < nxt:
+            time.sleep(nxt - done)
+        else:
+            missed += 1
+            nxt = done
+        if done - last_bat > 1.0:
+            bats.append(battery_w())
+            last_bat = done
+    e1, t1 = read_energy(), time.monotonic()
+    os.sched_setaffinity(0, set(cpus()))
+    lat.sort()
+    bats = [b for b in bats if b == b]
+    return {
+        "bursts": len(lat),
+        "pkg_w": joules(e0[0], e1[0]) / (t1 - t0),
+        "core_w": joules(e0[1], e1[1]) / (t1 - t0),
+        "bat_w": sum(bats) / len(bats) if bats else float("nan"),
+        "p50_ms": lat[len(lat) // 2] * 1000,
+        "p95_ms": lat[int(len(lat) * 0.95)] * 1000,
+        "missed": missed,
+        "errors": bad,
+    }
+
+
+# ------------------------------------------------------------------ output
+
+class Table:
+    def __init__(self, outdir, name, cols):
+        self.cols = cols
+        self.rows = []
+        self.f = open(outdir / f"{name}.csv", "w", newline="")
+        self.w = csv.DictWriter(self.f, fieldnames=cols)
+        self.w.writeheader()
+        say("  " + "  ".join(f"{c:>9}" for c in cols))
+
+    def add(self, **row):
+        self.rows.append(row)
+        self.w.writerow({c: row.get(c, "") for c in self.cols})
+        self.f.flush()
+        say("  " + "  ".join(
+            f"{row[c]:>9.2f}" if isinstance(row.get(c), float) else f"{str(row.get(c, '')):>9}"
+            for c in self.cols))
+        if row.get("errors"):
+            say(f"  !! {row['errors']} wrong results: this setting is UNSTABLE")
+
+
+# ------------------------------------------------------------------ phases
+
+def phase_co(a, outdir, saved, ctx):
+    say("\n== CO A/B: same load, same limits, CO 0 vs offsets (ABBA order)")
+    values = a.co_values
+    order = values + values[::-1]
+    limits = [15, 45] if a.quick else [12, 28, 54]
+    secs, warm = (12, 5) if a.quick else (30, 8)
+    t = Table(outdir, "co", ["limit_w", "stapm_w", "co", "mbps", "mhz", "pkg_w",
+                             "core_w", "tctl", "errors", "drift"])
+    res = {}
+    for lim in limits:
+        for co in order:
+            set_co(co)
+            actual = set_limits(lim)
+            if abs(actual[0] - lim) > 1:
+                say(f"  (EC/SMU clamped {lim} W to {actual[0]:.0f} W)")
+            cooldown()
+            r = run_load(ctx["all"], secs, warm)
+            t.add(limit_w=float(lim), co=co, **{k: r[k] for k in (
+                "stapm_w", "mbps", "mhz", "pkg_w", "core_w", "tctl", "errors", "drift")})
+            res.setdefault((lim, co), []).append(r)
+    set_co(CO_PX13)
+    say("\n  CO effect (mean of 2 runs; positive = better):")
+    say(f"  {'limit':>6} {'CO':>5} {'MB/s':>9} {'d%':>7} {'MHz':>7} {'dMHz':>6} {'W':>6} {'dW%':>7}")
+    for lim in limits:
+        base = res[(lim, values[0])]
+        bm = sum(r["mbps"] for r in base) / len(base)
+        bf = sum(r["mhz"] for r in base) / len(base)
+        bw = sum(r["pkg_w"] for r in base) / len(base)
+        for co in values:
+            rs = res[(lim, co)]
+            m = sum(r["mbps"] for r in rs) / len(rs)
+            f = sum(r["mhz"] for r in rs) / len(rs)
+            w = sum(r["pkg_w"] for r in rs) / len(rs)
+            say(f"  {lim:>5}W {co:>5} {m:>9.0f} {100*(m/bm-1):>+6.1f}% {f:>7.0f} {f-bf:>+6.0f} "
+                f"{w:>6.1f} {100*(w/bw-1):>+6.1f}%")
+    say("  Reading it: a working CO shows more MHz/MB/s at the same W (limit-bound),")
+    say("  or the same MHz at fewer W. All ~0%: the offset is accepted but inert.")
+
+
+def phase_curve(a, outdir, saved, ctx):
+    say("\n== Single-core frequency curve (limits opened to 45 W)")
+    set_co(CO_PX13)
+    set_limits(45)
+    set_epp("performance")
+    secs, warm = (3, 1) if a.quick else (6, 2)
+    idle_pkg, idle_core = run_idle(5 if a.quick else 10)
+    say(f"  idle: pkg {idle_pkg:.2f} W, core {idle_core:.2f} W")
+    all_cpus = cpus()
+    for name, c in (("zen5", ctx["z5"]), ("zen5c", ctx["z5c"])):
+        if c is None:
+            continue
+        top = hw_max_khz(c)
+        steps = 6 if a.quick else 12
+        freqs = sorted({int(hw_min_khz() + (top - hw_min_khz()) * i / (steps - 1)) // 1000 * 1000
+                        for i in range(steps)})
+        say(f"\n  {name} (cpu{c}), up to {top/1e6:.2f} GHz")
+        t = Table(outdir, f"curve_{name}", ["set_mhz", "mhz", "mbps", "pkg_w", "core_w",
+                                            "mbps_per_w", "mj_per_mb", "tctl", "errors"])
+        rows = []
+        for f in freqs:
+            # A core runs at the faster of its threads' requests, so pin both
+            # SMT siblings and hold every other CPU at the floor.
+            mine = siblings(c)
+            set_range([x for x in all_cpus if x not in mine], hw_min_khz(), hw_min_khz())
+            set_range(mine, f, f)
+            cooldown(64, 30)
+            r = run_load([c], secs, warm)
+            if abs(r["mhz"] - f / 1000) > 0.1 * f / 1000 + 100:
+                say(f"  !! asked for {f/1000:.0f} MHz, core ran at {r['mhz']:.0f}: pin did not hold")
+            r["set_mhz"] = f / 1000
+            r["mbps_per_w"] = r["mbps"] / r["pkg_w"]
+            r["mj_per_mb"] = 1000 * r["pkg_w"] / r["mbps"]
+            t.add(**{k: (float(r[k]) if isinstance(r[k], float) else r[k]) for k in t.cols})
+            rows.append(r)
+        set_range(all_cpus, hw_min_khz(), top)
+        best = max(rows, key=lambda r: r["mbps_per_w"])
+        topr = rows[-1]
+        say(f"  -> best MB/s per W at ~{best['mhz']:.0f} MHz "
+            f"({best['mj_per_mb']:.1f} mJ/MB vs {topr['mj_per_mb']:.1f} at {topr['mhz']:.0f} MHz: "
+            f"{topr['mj_per_mb']/best['mj_per_mb']:.1f}x more energy per unit of work)")
+    set_range(all_cpus, hw_min_khz(), hw_max_khz(ctx["z5"]))
+
+
+def phase_limits(a, outdir, saved, ctx):
+    say("\n== All-thread throughput vs power limit")
+    set_co(CO_PX13)
+    set_epp("performance")
+    limits = [8, 15, 28, 54] if a.quick else a.limits
+    secs, warm = (12, 5) if a.quick else (25, 8)
+    for label, which in (("24t", ctx["all"]), ("12t", ctx["primary"])):
+        if a.quick and label == "12t":
+            continue
+        say(f"\n  {label} ({len(which)} threads)")
+        t = Table(outdir, f"limits_{label}", ["limit_w", "stapm_w", "mbps", "mhz", "pkg_w",
+                                              "mbps_per_w", "marg_mbps_w", "tctl", "errors", "drift"])
+        prev = None
+        for lim in limits:
+            actual = set_limits(lim)
+            if abs(actual[0] - lim) > 1:
+                say(f"  (EC/SMU clamped {lim} W to {actual[0]:.0f} W)")
+            cooldown()
+            r = run_load(which, secs, warm)
+            r["limit_w"] = float(lim)
+            r["mbps_per_w"] = r["mbps"] / r["pkg_w"]
+            r["marg_mbps_w"] = ((r["mbps"] - prev["mbps"]) / (r["pkg_w"] - prev["pkg_w"])
+                                if prev and r["pkg_w"] - prev["pkg_w"] > 0.3 else float("nan"))
+            t.add(**{k: (float(r[k]) if isinstance(r[k], float) else r[k]) for k in t.cols})
+            prev = r
+    say("  marg_mbps_w = extra throughput per extra watt vs the previous row: where it")
+    say("  collapses is the limit past which power is mostly wasted.")
+
+
+def pareto(rows, keys):
+    out = []
+    for r in rows:
+        dominated = any(all(o[k] <= r[k] for k in keys) and any(o[k] < r[k] for k in keys)
+                        for o in rows if o is not r)
+        out.append(not dominated)
+    return out
+
+
+def phase_race(a, outdir, saved, ctx):
+    say("\n== Race to idle: energy over a fixed window, frequency cap x EPP")
+    z5 = ctx["z5"]
+    top = hw_max_khz(z5)
+    caps = [1200, 2000, 3000, 4000, top // 1000] if not a.quick else [1200, 3000, top // 1000]
+    epps = ["power", "balance_power", "balance_performance"]
+    if a.quick:
+        epps = ["power", "balance_performance"]
+    window = 12 if a.quick else 20
+    lim = read_limits()
+    say(f"  limits during this phase: {lim[0]:.0f}/{lim[1]:.0f}/{lim[2]:.0f} W "
+        f"(change mode with px13 first to test another)")
+    if not on_ac():
+        say("  on battery: bat_w is whole-system power, the number that decides battery life")
+    set_co(CO_PX13)
+    all_cpus = cpus()
+    # Rate at full speed fixes the work per burst.
+    set_epp("performance")
+    set_range(all_cpus, hw_min_khz(), top)
+    ips = calibrate(z5)
+    patterns = {"ui": (0.015, 0.100), "sprint": (2.0, window / 2)}
+    cols = ["pattern", "cap_mhz", "epp", "pkg_w", "core_w", "bat_w", "mj_burst",
+            "p50_ms", "p95_ms", "missed", "errors", "pareto"]
+    for pname, (chunk_s, period) in patterns.items():
+        chunk_iters = max(1, int(ips * chunk_s))
+        say(f"\n  pattern {pname}: {chunk_s*1000:.0f} ms of work (at full speed) every {period*1000:.0f} ms")
+        t = Table(outdir, f"race_{pname}", cols)
+        rows = []
+        for cap in caps:
+            for epp in epps:
+                set_epp(epp)
+                set_range(all_cpus, hw_min_khz(), cap * 1000)
+                cooldown(64, 30)
+                time.sleep(1.0)
+                r = burst(z5, chunk_iters, period, window)
+                r["pattern"], r["cap_mhz"], r["epp"] = pname, cap, epp
+                r["mj_burst"] = 1000 * r["pkg_w"] * window / r["bursts"]
+                rows.append(r)
+        for r, p in zip(rows, pareto(rows, ("pkg_w", "p95_ms"))):
+            r["pareto"] = "*" if p else ""
+            t.add(**{k: (float(r[k]) if isinstance(r[k], float) else r[k]) for k in cols})
+        best = min((r for r in rows if r["missed"] == 0), key=lambda r: r["pkg_w"], default=None)
+        if best:
+            say(f"  -> lowest package power that never overran: cap {best['cap_mhz']} MHz, "
+                f"EPP {best['epp']} ({best['pkg_w']:.2f} W, p95 {best['p95_ms']:.1f} ms)")
+    say("  * = Pareto-optimal (no other setting has both lower power and lower p95 latency).")
+    set_range(all_cpus, hw_min_khz(), top)
+
+
+T95 = {1: 12.7, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26}
+
+
+def mean_sd(xs):
+    m = sum(xs) / len(xs)
+    sd = (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5 if len(xs) > 1 else float("nan")
+    return m, sd
+
+
+def phase_epp(a, outdir, saved, ctx):
+    say("\n== EPP confirmation: repeated runs of the UI burst pattern, uncapped")
+    z5 = ctx["z5"]
+    top = hw_max_khz(z5)
+    epps = a.epps
+    reps = 2 if a.quick else a.reps
+    window = 15 if a.quick else a.window
+    set_co(CO_PX13)
+    all_cpus = cpus()
+    set_epp("performance")
+    set_range(all_cpus, hw_min_khz(), top)
+    ips = calibrate(z5)
+    chunk_iters = max(1, int(ips * 0.015))
+    lim = read_limits()
+    say(f"  limits {lim[0]:.0f}/{lim[1]:.0f}/{lim[2]:.0f} W, {reps} reps x {len(epps)} EPPs x {window}s, "
+        f"15 ms of work every 100 ms, order rotated each rep")
+    t = Table(outdir, "epp", ["rep", "epp", "pkg_w", "bat_w", "p50_ms", "p95_ms", "missed", "errors", "tctl"])
+    data = {e: [] for e in epps}
+    for rep in range(reps):
+        for e in epps[rep % len(epps):] + epps[:rep % len(epps)]:
+            set_epp(e)
+            cooldown(64, 30)
+            time.sleep(2.0)
+            r = burst(z5, chunk_iters, 0.100, window)
+            r.update(rep=rep, epp=e, tctl=tctl())
+            t.add(**{k: (float(r[k]) if isinstance(r[k], float) else r[k]) for k in t.cols})
+            data[e].append(r)
+    base = epps[0]
+    say(f"\n  mean +- sd over {reps} runs, and paired difference vs {base} (+- 95% CI)")
+    say(f"  {'epp':<20}{'pkg W':>14}{'d pkg W':>16}{'bat W':>14}{'d bat W':>16}{'p95 ms':>14}")
+    for e in epps:
+        cells = []
+        for key in ("pkg_w", "bat_w", "p95_ms"):
+            xs = [r[key] for r in data[e]]
+            ok = all(x == x for x in xs)
+            m, sd = mean_sd(xs) if ok else (float("nan"),) * 2
+            cells.append(f"{m:.2f}+-{sd:.2f}" if ok else "n/a")
+            if key == "p95_ms":
+                break
+            if e == base or not ok:
+                cells.append("-")
+                continue
+            d = [x - y for x, y in zip(xs, [r[key] for r in data[base]])]
+            dm, dsd = mean_sd(d)
+            ci = T95.get(len(d) - 1, 2.0) * dsd / len(d) ** 0.5
+            cells.append(f"{dm:+.2f}+-{ci:.2f}{'*' if abs(dm) > ci else ' '}")
+        say(f"  {e:<20}{cells[0]:>14}{cells[1]:>16}{cells[2]:>14}{cells[3]:>16}{cells[4]:>14}")
+    say("  * = difference larger than its 95% CI, i.e. unlikely to be noise.")
+    set_range(all_cpus, hw_min_khz(), top)
+
+
+def phase_soak(a, outdir, saved, ctx):
+    """Time series of power, temperature and fans under a sustained or bursty load."""
+    say(f"\n== Soak '{a.label}': load {a.load}, {a.duration}s, limits {a.soak_limits}, fan curve {a.fan_curve}")
+    target = None
+    if a.soak_limits != "keep":
+        target = tuple(float(x) for x in a.soak_limits.split(","))
+        got = set_limits3(*target)
+        say(f"  limits set: {got[0]:.0f}/{got[1]:.0f}/{got[2]:.0f} W")
+    else:
+        got = read_limits()
+        say(f"  limits kept: {got[0]:.0f}/{got[1]:.0f}/{got[2]:.0f} W")
+        target = got
+    if a.fan_curve != "stock":
+        set_fan_curve(saved, a.fan_curve)
+        say(f"  custom fan curve on {saved.fan_profile}: {a.fan_curve}")
+    if a.cool_start:
+        say(f"  waiting for Tctl <= {a.cool_start} C (now {tctl():.0f})")
+        cooldown(a.cool_start, 600)
+    which = ctx["all"]
+    if a.load.startswith("burst:"):
+        on_s, period = (float(x) for x in a.load[6:].split("/"))
+    elif a.load == "all":
+        on_s, period = 1.0, 1.0
+    else:  # idle
+        on_s, period = 0.0, 1.0
+    n = len(which)
+    counters = mp.Array("Q", n, lock=False)
+    errors = mp.Array("Q", n, lock=False)
+    stop, go = mp.Event(), mp.Value("b", 0, lock=False)
+    procs = []
+    if on_s > 0:
+        procs = [mp.Process(target=gated_worker, args=(i, c, counters, errors, stop, go), daemon=True)
+                 for i, c in enumerate(which)]
+        for p in procs:
+            p.start()
+    cols = ["t", "busy", "pkg_w", "mbps", "mhz", "tctl", "fan1", "fan2", "bat_w"]
+    f = open(outdir / f"soak_{a.label}.csv", "w", newline="")
+    w = csv.DictWriter(f, fieldnames=cols)
+    w.writeheader()
+    rows, first_fan, aborted, reapplied = [], None, False, 0
+    t0 = time.monotonic()
+    e_prev, n_prev, t_prev = read_energy(), 0, t0
+    busy_s = 0.0
+    next_log = t0 + 1.0
+    try:
+        while True:
+            now = time.monotonic()
+            el = now - t0
+            if el >= a.duration:
+                break
+            go.value = 1 if (on_s > 0 and not aborted and (el % period) < on_s) else 0
+            if now >= next_log:
+                e, cnt = read_energy(), sum(counters)
+                dt = now - t_prev
+                temp, (f1, f2) = tctl(), fan_rpm()
+                mhz = (sum(int(rd(pol(c) / "scaling_cur_freq")) for c in which) / n / 1000)
+                row = {"t": round(el, 1), "busy": int(go.value), "pkg_w": joules(e_prev[0], e[0]) / dt,
+                       "mbps": (cnt - n_prev) * BUF_MB / dt, "mhz": mhz, "tctl": temp,
+                       "fan1": f1, "fan2": f2, "bat_w": battery_w()}
+                w.writerow(row)
+                f.flush()
+                rows.append(row)
+                if first_fan is None and (f1 > 0 or f2 > 0):
+                    first_fan = (el, temp)
+                    say(f"  fans started at t={el:.0f}s, Tctl {temp:.1f} C")
+                if int(el) % 30 == 0:
+                    say(f"  t={el:4.0f}s  pkg {row['pkg_w']:5.1f} W  Tctl {temp:5.1f} C  fans {f1}/{f2} rpm  "
+                        f"{row['mbps']:7.0f} MB/s")
+                if temp > a.max_temp and not aborted:
+                    aborted = True
+                    say(f"  !! Tctl {temp:.1f} C > {a.max_temp}: load stopped, still logging")
+                if int(el) % 10 == 0 and target:
+                    lim = read_limits()
+                    if any(abs(x - y) > 0.6 for x, y in zip(lim, target)):
+                        set_limits3(*target)
+                        reapplied += 1
+                e_prev, n_prev, t_prev = e, cnt, now
+                next_log += 1.0
+            time.sleep(0.02)
+    finally:
+        stop.set()
+        go.value = 0
+        for p in procs:
+            p.join(2)
+        f.close()
+    last = [r for r in rows if r["t"] >= a.duration - 60]
+    avg = lambda k, rs: sum(r[k] for r in rs) / len(rs) if rs else float("nan")
+    total_mb = sum(r["mbps"] for r in rows)
+    say(f"\n  summary '{a.label}':")
+    say(f"    fans first spun: {'never' if not first_fan else f't={first_fan[0]:.0f}s at {first_fan[1]:.1f} C'}")
+    say(f"    max Tctl {max(r['tctl'] for r in rows):.1f} C; last 60 s: pkg {avg('pkg_w', last):.1f} W, "
+        f"Tctl {avg('tctl', last):.1f} C, fans {avg('fan1', last):.0f}/{avg('fan2', last):.0f} rpm, "
+        f"{avg('mbps', last):.0f} MB/s")
+    say(f"    whole run: {total_mb / 1000:.1f} GB hashed, avg pkg {avg('pkg_w', rows):.1f} W, "
+        f"errors {sum(errors)}, limit re-applies {reapplied}{', ABORTED on temperature' if aborted else ''}")
+
+
+# -------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--phase", default="all", choices=["all", "co", "curve", "limits", "race", "epp", "soak"])
+    ap.add_argument("--quick", action="store_true", help="short runs, fewer points (~5 min total)")
+    ap.add_argument("--out", help="output directory (default ~/px13-sweep/<timestamp>)")
+    ap.add_argument("--co-values", type=lambda s: [int(x) for x in s.split(",")], default=[0, CO_PX13],
+                    help="CO offsets to compare; the first is the baseline (default 0,-25). "
+                         "Going beyond -25 can hang the machine; test one step at a time.")
+    ap.add_argument("--epps", type=lambda s: s.split(","),
+                    default=["power", "balance_power", "balance_performance"],
+                    help="EPP values for --phase epp; the first is the baseline")
+    ap.add_argument("--reps", type=int, default=5, help="repeats for --phase epp")
+    ap.add_argument("--window", type=int, default=40, help="seconds per run for --phase epp")
+    ap.add_argument("--label", default="run", help="name for --phase soak output")
+    ap.add_argument("--load", default="all", help="soak load: all | idle | burst:ON/PERIOD (seconds)")
+    ap.add_argument("--duration", type=int, default=180, help="soak seconds")
+    ap.add_argument("--soak-limits", default="keep", help="soak limits STAPM,SLOW,FAST in W, or keep")
+    ap.add_argument("--fan-curve", default="stock",
+                    help="soak fan curve for the active profile, asusctl format (8 points), or stock")
+    ap.add_argument("--max-temp", type=float, default=88.0, help="soak: stop the load above this Tctl")
+    ap.add_argument("--cool-start", type=float, default=0, help="soak: wait for this Tctl before starting")
+    ap.add_argument("--limits", type=lambda s: [int(x) for x in s.split(",")],
+                    default=[8, 10, 12, 15, 20, 25, 28, 35, 45, 54, 65])
+    a = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("Run as root: sudo px13-sweep ...")
+    user = os.environ.get("SUDO_USER", "root")
+    home = Path(pwd.getpwnam(user).pw_dir)
+    outdir = Path(a.out) if a.out else home / "px13-sweep" / time.strftime("%Y%m%d-%H%M%S")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    saved = Saved()
+    atexit.register(saved.restore)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(130))
+    sh("systemctl", "stop", "px13-watch")
+
+    z5, z5c = core_classes()
+    ctx = {"all": cpus(), "primary": primary_threads(), "z5": z5, "z5c": z5c}
+    say(f"Zen 5 core: cpu{z5}; Zen 5c core: cpu{z5c}; {len(ctx['all'])} threads; "
+        f"{'AC' if on_ac() else 'battery'}; start temp {tctl():.0f} C; results -> {outdir}")
+    run = {"co": phase_co, "curve": phase_curve, "limits": phase_limits, "race": phase_race,
+           "epp": phase_epp, "soak": phase_soak}
+    todo = ["co", "curve", "limits", "race"] if a.phase == "all" else [a.phase]
+    start = time.time()
+    for name in todo:
+        run[name](a, outdir, saved, ctx)
+    say(f"\nDone in {(time.time() - start) / 60:.1f} min. CSVs: {outdir}")
+    if user != "root":
+        sh("chown", "-R", f"{user}:", str(outdir))
+
+
+if __name__ == "__main__":
+    main()

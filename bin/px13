@@ -69,12 +69,18 @@ declare -A MODES=(
   [normal]="balanced 25000 25000 35000"
   [perf]="performance 65000 70000 85000"
 )
-# EPP per mode, set after power-profiles-daemon applies the profile (empty:
-# keep the daemon's choice). power-saver's "power" made 15 ms bursts 36%
-# slower than balance_power with no measurable energy saving (px13-sweep).
-declare -A MODE_EPP=(
-  [eco]="balance_power"
-)
+# EPP per mode, enforced in every mode: the clamp fix restores the EPP it
+# saw, which can be a stale one from mid profile change. power-saver's
+# "power" made 15 ms bursts 36% slower than balance_power with no
+# measurable energy saving (px13-sweep); normal follows the daemon's own
+# choice (balance_power on battery, balance_performance on AC).
+mode_epp() {
+  case "$1" in
+    eco) echo balance_power ;;
+    normal) on_ac && echo balance_performance || echo balance_power ;;
+    perf) echo performance ;;
+  esac
+}
 
 # eco's Quiet fan curve: off up to 70 C, ramping in above it only as a safety
 # net. The stock Quiet curve starts the fans at 48-52 C, which even 9 W
@@ -496,7 +502,8 @@ current_epp() {
 
 # Sets the mode's EPP on every CPU if it has one and differs; logs on change.
 apply_mode_epp() {
-  local want="${MODE_EPP[$1]:-}" f
+  local want f
+  want="$(mode_epp "$1")"
   [[ -n "${want}" && "$(current_epp)" != "${want}" ]] || return 0
   for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
     printf '%s\n' "${want}" > "${f}" 2>/dev/null || true

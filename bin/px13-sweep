@@ -647,9 +647,9 @@ def phase_soak(a, outdir, saved, ctx):
         got = set_limits3(*target)
         say(f"  limits set: {got[0]:.0f}/{got[1]:.0f}/{got[2]:.0f} W")
     else:
+        # Observe only: never correct, so firmware behaviour shows in the log.
         got = read_limits()
-        say(f"  limits kept: {got[0]:.0f}/{got[1]:.0f}/{got[2]:.0f} W")
-        target = got
+        say(f"  limits kept (observe only): {got[0]:.0f}/{got[1]:.0f}/{got[2]:.0f} W")
     if a.fan_curve != "stock":
         set_fan_curve(saved, a.fan_curve)
         say(f"  custom fan curve on {saved.fan_profile}: {a.fan_curve}")
@@ -673,7 +673,8 @@ def phase_soak(a, outdir, saved, ctx):
                  for i, c in enumerate(which)]
         for p in procs:
             p.start()
-    cols = ["t", "busy", "pkg_w", "mbps", "mhz", "tctl", "fan1", "fan2", "bat_w"]
+    cols = ["t", "busy", "pkg_w", "mbps", "mhz", "tctl", "fan1", "fan2", "bat_w",
+            "stapm_w", "slow_w", "fast_w"]
     f = open(outdir / f"soak_{a.label}.csv", "w", newline="")
     w = csv.DictWriter(f, fieldnames=cols)
     w.writeheader()
@@ -697,6 +698,7 @@ def phase_soak(a, outdir, saved, ctx):
                 row = {"t": round(el, 1), "busy": int(go.value), "pkg_w": joules(e_prev[0], e[0]) / dt,
                        "mbps": (cnt - n_prev) * BUF_MB / dt, "mhz": mhz, "tctl": temp,
                        "fan1": f1, "fan2": f2, "bat_w": battery_w()}
+                row["stapm_w"], row["slow_w"], row["fast_w"] = read_limits()
                 w.writerow(row)
                 f.flush()
                 rows.append(row)

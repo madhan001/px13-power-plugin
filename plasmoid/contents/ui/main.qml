@@ -33,7 +33,7 @@ PlasmoidItem {
     readonly property bool gpuEcoOn: px.gpu_eco === "on"
 
     readonly property var modeInfo: ({
-        "eco": { label: "Eco", letter: "E", icon: "battery-profile-powersave-symbolic", watts: "15 / 15 / 20 W" },
+        "eco": { label: "Eco", letter: "E", icon: "battery-profile-powersave-symbolic", watts: "12 / 12 / 25 W, fanless" },
         "normal": { label: "Normal", letter: "N", icon: "battery-profile-balanced-symbolic", watts: "25 / 25 / 35 W" },
         "perf": { label: "Performance", letter: "P", icon: "battery-profile-performance-symbolic", watts: "up to 65 / 70 / 85 W" }
     })

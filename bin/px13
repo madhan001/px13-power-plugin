@@ -60,10 +60,12 @@ NVIDIA_SERVICES="nvidia-persistenced.service nvidia-powerd.service"
 PROTECTED_PROCS="kwin_wayland Xwayland plasmashell systemd systemd-logind"
 
 # mode -> "power-profile stapm_mW slow_mW fast_mW"
-# eco: 15 W sustained sits on the measured energy-per-task optimum (8-20 W).
+# eco is the fanless battery mode: 12 W sustained sits on the measured
+# energy-per-task optimum (8-20 W) and settled near 58 C after 7 min with the
+# fans held off; 25 W fast lasts ~4 s through the EC, enough for page loads.
 # perf: the EC ceilings on AC ("unleashed"); battery clamps to 56/65/85.
 declare -A MODES=(
-  [eco]="power-saver 15000 15000 20000"
+  [eco]="power-saver 12000 12000 25000"
   [normal]="balanced 25000 25000 35000"
   [perf]="performance 65000 70000 85000"
 )
@@ -73,6 +75,11 @@ declare -A MODES=(
 declare -A MODE_EPP=(
   [eco]="balance_power"
 )
+
+# eco's Quiet fan curve: off up to 70 C, ramping in above it only as a safety
+# net. The stock Quiet curve starts the fans at 48-52 C, which even 9 W
+# sustained reaches. Other modes keep asusd's stock curves.
+FANLESS_CURVE="30c:0%,45c:0%,55c:0%,65c:0%,70c:0%,75c:25%,80c:50%,85c:100%"
 
 # CPU mode follows the power source: perf on AC, eco on battery. A manual
 # choice holds until the next plug/unplug. "px13 auto off" disables it.
@@ -84,7 +91,8 @@ usage() {
   cat <<'EOF'
 Usage: px13 {eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
 
-  eco       power-saver, 15W/15W/20W, EPP balance_power, CO -25, NVIDIA PCI runtime auto
+  eco       fanless: power-saver, 12W/12W/25W, EPP balance_power, fans off below
+            70 C, CO -25, NVIDIA PCI runtime auto
   normal    balanced, 25W/25W/35W, CO -25, NVIDIA PCI runtime auto
   perf      performance, the EC ceilings: 65W/70W/85W on AC (56/65/85 on battery), CO -25
   cycle     eco -> normal -> perf -> eco
@@ -318,6 +326,7 @@ publish_state() {
     printf 'cpu_clamped=%s\n' "$(pstate_clamped && echo yes || echo no)"
     printf 'epp=%s\n' "$(current_epp)"
     printf 'cpu_policy=%s\n' "$(cpu_policy)"
+    printf 'fanless=%s\n' "$(fanless_curve_active && echo yes || echo no)"
     printf 'applied=%s\n' "${applied}"
     printf 'limit_path=%s\n' "$(ec_available && echo ec || echo ryzenadj)"
     printf 'gpu_config=%s\n' "${gpu_cfg}"
@@ -439,6 +448,46 @@ wait_for_firmware() {
   done
 }
 
+fan_curve_hwmon() {
+  local h n
+  for h in /sys/class/hwmon/hwmon*; do
+    read -r n 2>/dev/null < "${h}/name" || continue
+    [[ "${n}" == asus_custom_fan_curve ]] && { printf '%s\n' "${h}"; return 0; }
+  done
+  return 1
+}
+
+# True if both fans of the active profile run the fanless curve: custom curve
+# enabled, still off at 70 C (point 5) and topping out at 85 C (point 8).
+fanless_curve_active() {
+  local h fan v
+  h="$(fan_curve_hwmon)" || return 1
+  for fan in 1 2; do
+    read -r v < "${h}/pwm${fan}_enable" && [[ "${v}" == 1 ]] || return 1
+    read -r v < "${h}/pwm${fan}_auto_point5_temp" && [[ "${v}" == 70 ]] || return 1
+    read -r v < "${h}/pwm${fan}_auto_point5_pwm" && [[ "${v}" == 0 ]] || return 1
+    read -r v < "${h}/pwm${fan}_auto_point8_temp" && [[ "${v}" == 85 ]] || return 1
+  done
+}
+
+# eco runs the fanless curve on the Quiet profile; asusd stores it and
+# re-applies it on profile changes, px13 re-checks it like the limits.
+apply_mode_fans() {
+  local fan
+  [[ "$1" == eco && "$(current_profile)" == power-saver ]] || return 0
+  command -v asusctl >/dev/null 2>&1 || return 0
+  fanless_curve_active && return 0
+  for fan in cpu gpu; do
+    asusctl fan-curve --mod-profile Quiet --fan "${fan}" --data "${FANLESS_CURVE}" >/dev/null 2>&1 || true
+  done
+  asusctl fan-curve --mod-profile Quiet --enable-fan-curves true >/dev/null 2>&1 || true
+  if fanless_curve_active; then
+    log "Fanless fan curve set for eco (off below 70 C)."
+  else
+    log "Could not set the fanless fan curve via asusctl."
+  fi
+}
+
 current_epp() {
   local e=""
   read -r e 2>/dev/null < /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference || true
@@ -506,6 +555,7 @@ apply_mode() {
   [[ "$(current_profile)" != "$(mode_profile "$1")" ]] && changed=1
   apply_mode_limits "$1" || rc=$?
   apply_mode_epp "$1"
+  apply_mode_fans "$1"
   if ((changed)); then
     # A profile change can re-trigger the amd_pstate clamp a moment later.
     for i in 1 2 3 4; do
@@ -711,6 +761,7 @@ check() {
     fi
     # power-profiles-daemon rewrites EPP on its own events (AC changes).
     apply_mode_epp "${mode}"
+    apply_mode_fans "${mode}"
   fi
   cpu_auto_apply
   optimized_apply

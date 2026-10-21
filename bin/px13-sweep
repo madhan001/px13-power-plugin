@@ -14,15 +14,28 @@ Phases (default: all; --quick shortens every run):
   epp    repeated UI-burst runs per EPP with paired statistics (--reps, --window).
   soak   time series of power, Tctl and fan RPM under a load (--load, --duration,
          --soak-limits, --fan-curve); for fan and fanless tuning.
+  stability  Curve Optimizer screen: every --workloads entry, result-checked,
+         under all-core high power, one Zen 5 core at max boost, one Zen 5c
+         core, fast all-core bursts and all-core at 12 W; counts kernel
+         machine-check errors before and after.
   race   fixed time window incl. the idle tail, frequency cap x EPP, for a
          UI-like burst pattern and a sprint pattern: energy vs latency, with
          the Pareto-optimal settings marked.
 
 The px13 watcher is stopped for the run (it would re-apply limits and CO)
 and everything is restored afterwards, also on Ctrl-C. Results go to
-~/px13-sweep/<timestamp>/*.csv. The workload is SHA-256 on a 256 KiB buffer
-(SHA-NI, cache resident): a steady integer load, lighter than AVX-512 or
-memory-bound work, so treat absolute watts as a lower bound.
+~/px13-sweep/<timestamp>/*.csv.
+
+Workloads (--workload for co/curve/limits/soak, --workloads for stability;
+race and epp always use sha). Every unit of work is checked against a
+reference computed at start, so a miscalculation counts as an error:
+  sha        SHA-256 on 256 KiB, SHA-NI (integer, cache resident)  [MB]
+  zlib       zlib level 6 compress + decompress of 256 KiB text (scalar int) [MB]
+  aesgcm     AES-256-GCM via OpenSSL, VAES/AVX-512 on Zen 5 (vector int) [MB]
+  avx512fma  12 FMA chains on zmm registers over L1 data (C kernel) [GFLOP]
+  avx2fma    the same on ymm registers [GFLOP]
+  dgemm      NumPy 384x384 float64 matmul, OpenBLAS (AVX-512 kernel) [GFLOP]
+  mem        NumPy copy of 64 MiB (memory bound; rate counts read + write) [MB]
 """
 import argparse
 import atexit
@@ -37,6 +50,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# One BLAS thread per worker process; set before any NumPy import.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 CPU = Path("/sys/devices/system/cpu")
 RAPL = Path("/sys/class/powercap/intel-rapl:0")
@@ -254,42 +271,147 @@ class Saved:
 
 # ---------------------------------------------------------------- workload
 
-def worker(idx, cpu, counters, errors, stop):
-    os.sched_setaffinity(0, {cpu})
-    h = hashlib.sha256
-    n = bad = 0
-    while not stop.is_set():
-        for _ in range(64):
-            if h(BUF).digest() != REF:
-                bad += 1
-            n += 1
-        counters[idx] = n
-        errors[idx] = bad
+STRESS_C = r"""
+#include <immintrin.h>
+#define R12(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7) M(8) M(9) M(10) M(11)
+/* 12 independent FMA chains over 512 doubles of L1 data; bounded values
+   (x in [0.5, 0.99), y in [0, 0.5)), so the result is exact and repeatable. */
+double fma512(const double *x, const double *y, long n) {
+#define D5(i) __m512d a##i = _mm512_loadu_pd(x + 8 * (i));
+  R12(D5)
+  for (long k = 0; k < n; k++)
+    for (int j = 0; j < 512; j += 8) {
+      __m512d vx = _mm512_loadu_pd(x + j), vy = _mm512_loadu_pd(y + j);
+#define F5(i) a##i = _mm512_fmadd_pd(a##i, vx, vy);
+      R12(F5)
+    }
+  __m512d s = _mm512_setzero_pd();
+#define S5(i) s = _mm512_add_pd(s, a##i);
+  R12(S5)
+  return _mm512_reduce_add_pd(s);
+}
+double fma256(const double *x, const double *y, long n) {
+#define D2(i) __m256d a##i = _mm256_loadu_pd(x + 4 * (i));
+  R12(D2)
+  for (long k = 0; k < n; k++)
+    for (int j = 0; j < 512; j += 4) {
+      __m256d vx = _mm256_loadu_pd(x + j), vy = _mm256_loadu_pd(y + j);
+#define F2(i) a##i = _mm256_fmadd_pd(a##i, vx, vy);
+      R12(F2)
+    }
+  __m256d s = _mm256_setzero_pd();
+#define S2(i) s = _mm256_add_pd(s, a##i);
+  R12(S2)
+  double o[4];
+  _mm256_storeu_pd(o, s);
+  return o[0] + o[1] + o[2] + o[3];
+}
+"""
+
+# Work per call and its unit, per workload.
+FMA_N = 4000
+DGEMM_N = 384
+WL_UNITS = {
+    "sha": (BUF_MB, "MB"), "zlib": (BUF_MB, "MB"), "aesgcm": (BUF_MB, "MB"),
+    "avx512fma": (12288 * FMA_N / 1e9, "GFLOP"), "avx2fma": (12288 * FMA_N / 1e9, "GFLOP"),
+    "dgemm": (2 * DGEMM_N ** 3 / 1e9, "GFLOP"), "mem": (2 * 64 * 2 ** 20 / 1e6, "MB"),
+}
 
 
-def gated_worker(idx, cpu, counters, errors, stop, go):
+def build_stress_lib():
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix="px13-stress-"))
+    (d / "stress.c").write_text(STRESS_C)
+    so = d / "libpx13stress.so"
+    r = sh("gcc", "-O2", "-shared", "-fPIC", "-mavx2", "-mfma", "-mavx512f", "-mavx512vl",
+           "-o", str(so), str(d / "stress.c"))
+    if r.returncode:
+        sys.exit(f"gcc failed: {r.stderr}")
+    return str(so)
+
+
+def make_step(name, lib):
+    """A function doing one unit of `name` that returns True when its result checks out."""
+    if name == "sha":
+        h = hashlib.sha256
+        return lambda: h(BUF).digest() == REF
+    if name == "zlib":
+        import random
+        import zlib
+        rnd = random.Random(7)
+        words = ["power", "joule", "clock", "voltage", "cache", "fabric", "core", "boost",
+                 "thermal", "idle", "burst", "laptop", "battery", "curve", "offset"]
+        data = " ".join(rnd.choice(words) for _ in range(60000)).encode()[:len(BUF)]
+        ref = zlib.compress(data, 6)
+
+        def step():
+            c = zlib.compress(data, 6)
+            return c == ref and zlib.decompress(c) == data
+        return step
+    if name == "aesgcm":
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        aes, nonce = AESGCM(bytes(range(32))), bytes(12)
+        ref = aes.encrypt(nonce, BUF, None)
+        return lambda: aes.encrypt(nonce, BUF, None) == ref
+    if name in ("avx512fma", "avx2fma"):
+        import ctypes
+        import numpy as np
+        f = getattr(ctypes.CDLL(lib), "fma512" if name == "avx512fma" else "fma256")
+        f.restype, f.argtypes = ctypes.c_double, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        g = np.random.default_rng(3)
+        x, y = g.uniform(0.5, 0.99, 512), g.uniform(0.0, 0.5, 512)
+        ref = f(x.ctypes.data, y.ctypes.data, FMA_N)
+        return lambda: f(x.ctypes.data, y.ctypes.data, FMA_N) == ref
+    if name == "dgemm":
+        import numpy as np
+        g = np.random.default_rng(5)
+        a, b = g.standard_normal((DGEMM_N, DGEMM_N)), g.standard_normal((DGEMM_N, DGEMM_N))
+        ref = a @ b
+        return lambda: np.array_equal(a @ b, ref)
+    if name == "mem":
+        import numpy as np
+        src = np.arange(8 * 2 ** 20, dtype=np.float64)
+        dst, pick = np.empty_like(src), slice(None, None, 4099)
+
+        def step():
+            np.copyto(dst, src)
+            return np.array_equal(dst[pick], src[pick])
+        return step
+    raise ValueError(name)
+
+
+def worker(idx, cpu, counters, errors, stop, wl=("sha", None), go=None):
     os.sched_setaffinity(0, {cpu})
-    h = hashlib.sha256
+    step = make_step(*wl)
     n = bad = 0
-    while not stop.is_set():
-        if not go.value:
+    last = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now - last > 0.02:
+            last = now
+            if stop.is_set():
+                break
+        if go is not None and not go.value:
             time.sleep(0.005)
             continue
-        for _ in range(16):
-            if h(BUF).digest() != REF:
-                bad += 1
-            n += 1
+        if not step():
+            bad += 1
+        n += 1
         counters[idx] = n
         errors[idx] = bad
 
 
-def run_load(which, seconds, warmup):
+def gated_worker(idx, cpu, counters, errors, stop, go, wl=("sha", None)):
+    worker(idx, cpu, counters, errors, stop, wl, go)
+
+
+def run_load(which, seconds, warmup, wl=("sha", None)):
     """All of `which` busy; returns the measurement over `seconds`."""
     n = len(which)
     counters = mp.Array("Q", n, lock=False)
     errors = mp.Array("Q", n, lock=False)
     stop = mp.Event()
-    procs = [mp.Process(target=worker, args=(i, c, counters, errors, stop))
+    procs = [mp.Process(target=worker, args=(i, c, counters, errors, stop, wl))
              for i, c in enumerate(which)]
     for p in procs:
         p.daemon = True  # a Ctrl-C mid-run must not hang on join
@@ -311,7 +433,7 @@ def run_load(which, seconds, warmup):
     dt = t1 - t0
     bats = [b for b in bat if b == b]
     return {
-        "mbps": (n1 - n0) * BUF_MB / dt,
+        "mbps": (n1 - n0) * WL_UNITS[wl[0]][0] / dt,
         "mhz": sum(mhz) / len(mhz),
         "pkg_w": joules(e0[0], e1[0]) / dt,
         "core_w": joules(e0[1], e1[1]) / dt,
@@ -408,6 +530,81 @@ class Table:
 
 # ------------------------------------------------------------------ phases
 
+def run_bursty(which, seconds, on_s, period, wl):
+    """All of `which` switching between load and idle: on_s busy every period."""
+    n = len(which)
+    counters = mp.Array("Q", n, lock=False)
+    errors = mp.Array("Q", n, lock=False)
+    stop, go = mp.Event(), mp.Value("b", 0, lock=False)
+    procs = [mp.Process(target=worker, args=(i, c, counters, errors, stop, wl, go), daemon=True)
+             for i, c in enumerate(which)]
+    for p in procs:
+        p.start()
+    time.sleep(2.0)
+    temps, next_t = [], 0.0
+    e0, t0 = read_energy(), time.monotonic()
+    while (el := time.monotonic() - t0) < seconds:
+        go.value = 1 if el % period < on_s else 0
+        if el >= next_t:
+            temps.append(tctl())
+            next_t += 0.25
+        time.sleep(0.005)
+    go.value = 0
+    e1, t1, units = read_energy(), time.monotonic(), sum(counters)
+    stop.set()
+    for p in procs:
+        p.join()
+    return {"mbps": units * WL_UNITS[wl[0]][0] / (t1 - t0), "mhz": float("nan"),
+            "pkg_w": joules(e0[0], e1[0]) / (t1 - t0), "tctl": max(temps), "errors": sum(errors)}
+
+
+def mce_count():
+    out = sh("journalctl", "-k", "-b", "--no-pager", "-q").stdout
+    return sum(1 for line in out.splitlines()
+               if re.search(r"mce:|machine check|hardware error", line, re.I))
+
+
+def phase_stability(a, outdir, saved, ctx):
+    secs = 20 if a.quick else a.stab_secs
+    lib = ctx["wl"][1]
+    say(f"\n== CO stability screen at CO {CO_PX13}: {', '.join(a.workloads)}; {secs} s per condition")
+    set_co(CO_PX13)
+    set_epp("performance")
+    all_cpus = cpus()
+    set_range(all_cpus, hw_min_khz(), hw_max_khz(ctx["z5"]))
+    lim0 = read_limits()
+    mce0 = mce_count()
+    say(f"  limits {lim0[0]:.0f}/{lim0[1]:.0f}/{lim0[2]:.0f} W, kernel machine-check lines so far: {mce0}")
+    conditions = [
+        ("all-core high power", all_cpus, None),
+        ("Zen 5 core max boost", [ctx["z5"]], None),
+        ("Zen 5c core", [ctx["z5c"]], None),
+        ("all-core bursts 0.2/0.5 s", all_cpus, (0.2, 0.5)),
+        ("all-core at 12 W", all_cpus, "low"),
+    ]
+    t = Table(outdir, "stability", ["workload", "condition", "rate", "unit", "mhz", "pkg_w", "tctl", "errors"])
+    total = 0
+    for name in a.workloads:
+        wl = (name, lib)
+        for cond, which, mode in conditions:
+            if mode == "low":
+                set_limits(12)
+            cooldown(70, 45)
+            if isinstance(mode, tuple):
+                r = run_bursty(which, secs, mode[0], mode[1], wl)
+            else:
+                r = run_load(which, secs, 3, wl)
+            if mode == "low":
+                set_limits3(*lim0)
+            total += r["errors"]
+            t.add(workload=name, condition=cond, rate=float(r["mbps"]), unit=WL_UNITS[name][1] + "/s",
+                  mhz=float(r["mhz"]), pkg_w=float(r["pkg_w"]), tctl=float(r["tctl"]), errors=r["errors"])
+    mce1 = mce_count()
+    say(f"\n  result: {total} wrong results; kernel machine-check lines {mce0} -> {mce1}")
+    say("  PASS (no errors in this screen; hours of testing catch rarer faults)" if total == 0 and mce1 == mce0
+        else "  FAIL: errors under CO " + str(CO_PX13) + "; rerun the failing case with --co-values 0 to confirm")
+
+
 def phase_co(a, outdir, saved, ctx):
     say("\n== CO A/B: same load, same limits, CO 0 vs offsets (ABBA order)")
     values = a.co_values
@@ -424,7 +621,7 @@ def phase_co(a, outdir, saved, ctx):
             if abs(actual[0] - lim) > 1:
                 say(f"  (EC/SMU clamped {lim} W to {actual[0]:.0f} W)")
             cooldown()
-            r = run_load(ctx["all"], secs, warm)
+            r = run_load(ctx["all"], secs, warm, ctx["wl"])
             t.add(limit_w=float(lim), co=co, **{k: r[k] for k in (
                 "stapm_w", "mbps", "mhz", "pkg_w", "core_w", "tctl", "errors", "drift")})
             res.setdefault((lim, co), []).append(r)
@@ -474,7 +671,7 @@ def phase_curve(a, outdir, saved, ctx):
             set_range([x for x in all_cpus if x not in mine], hw_min_khz(), hw_min_khz())
             set_range(mine, f, f)
             cooldown(64, 30)
-            r = run_load([c], secs, warm)
+            r = run_load([c], secs, warm, ctx["wl"])
             if abs(r["mhz"] - f / 1000) > 0.1 * f / 1000 + 100:
                 say(f"  !! asked for {f/1000:.0f} MHz, core ran at {r['mhz']:.0f}: pin did not hold")
             r["set_mhz"] = f / 1000
@@ -498,7 +695,7 @@ def phase_limits(a, outdir, saved, ctx):
     limits = [8, 15, 28, 54] if a.quick else a.limits
     secs, warm = (12, 5) if a.quick else (25, 8)
     for label, which in (("24t", ctx["all"]), ("12t", ctx["primary"])):
-        if a.quick and label == "12t":
+        if (a.quick and label == "12t") or label not in a.limit_threads:
             continue
         say(f"\n  {label} ({len(which)} threads)")
         t = Table(outdir, f"limits_{label}", ["limit_w", "stapm_w", "mbps", "mhz", "pkg_w",
@@ -509,7 +706,7 @@ def phase_limits(a, outdir, saved, ctx):
             if abs(actual[0] - lim) > 1:
                 say(f"  (EC/SMU clamped {lim} W to {actual[0]:.0f} W)")
             cooldown()
-            r = run_load(which, secs, warm)
+            r = run_load(which, secs, warm, ctx["wl"])
             r["limit_w"] = float(lim)
             r["mbps_per_w"] = r["mbps"] / r["pkg_w"]
             r["marg_mbps_w"] = ((r["mbps"] - prev["mbps"]) / (r["pkg_w"] - prev["pkg_w"])
@@ -669,7 +866,7 @@ def phase_soak(a, outdir, saved, ctx):
     stop, go = mp.Event(), mp.Value("b", 0, lock=False)
     procs = []
     if on_s > 0:
-        procs = [mp.Process(target=gated_worker, args=(i, c, counters, errors, stop, go), daemon=True)
+        procs = [mp.Process(target=gated_worker, args=(i, c, counters, errors, stop, go, ctx["wl"]), daemon=True)
                  for i, c in enumerate(which)]
         for p in procs:
             p.start()
@@ -696,7 +893,7 @@ def phase_soak(a, outdir, saved, ctx):
                 temp, (f1, f2) = tctl(), fan_rpm()
                 mhz = (sum(int(rd(pol(c) / "scaling_cur_freq")) for c in which) / n / 1000)
                 row = {"t": round(el, 1), "busy": int(go.value), "pkg_w": joules(e_prev[0], e[0]) / dt,
-                       "mbps": (cnt - n_prev) * BUF_MB / dt, "mhz": mhz, "tctl": temp,
+                       "mbps": (cnt - n_prev) * WL_UNITS[ctx["wl"][0]][0] / dt, "mhz": mhz, "tctl": temp,
                        "fan1": f1, "fan2": f2, "bat_w": battery_w()}
                 row["stapm_w"], row["slow_w"], row["fast_w"] = read_limits()
                 w.writerow(row)
@@ -741,7 +938,15 @@ def phase_soak(a, outdir, saved, ctx):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", default="all", choices=["all", "co", "curve", "limits", "race", "epp", "soak"])
+    ap.add_argument("--phase", default="all", choices=["all", "co", "curve", "limits", "race", "epp", "soak", "stability"])
+    ap.add_argument("--workload", default="sha", choices=list(WL_UNITS),
+                    help="load for co/curve/limits/soak (default sha)")
+    ap.add_argument("--workloads", type=lambda s: s.split(","),
+                    default=["avx512fma", "avx2fma", "dgemm", "aesgcm", "zlib"],
+                    help="loads for --phase stability")
+    ap.add_argument("--stab-secs", type=int, default=60, help="seconds per stability condition")
+    ap.add_argument("--limit-threads", type=lambda s: s.split(","), default=["24t", "12t"],
+                    help="thread counts for --phase limits (24t, 12t)")
     ap.add_argument("--quick", action="store_true", help="short runs, fewer points (~5 min total)")
     ap.add_argument("--out", help="output directory (default ~/px13-sweep/<timestamp>)")
     ap.add_argument("--co-values", type=lambda s: [int(x) for x in s.split(",")], default=[0, CO_PX13],
@@ -777,11 +982,16 @@ def main():
     sh("systemctl", "stop", "px13-watch")
 
     z5, z5c = core_classes()
-    ctx = {"all": cpus(), "primary": primary_threads(), "z5": z5, "z5c": z5c}
-    say(f"Zen 5 core: cpu{z5}; Zen 5c core: cpu{z5c}; {len(ctx['all'])} threads; "
+    lib = build_stress_lib() if "fma" in a.workload or (
+        a.phase == "stability" and any("fma" in w for w in a.workloads)) else None
+    for w in ([a.workload] + (a.workloads if a.phase == "stability" else [])):
+        if w not in WL_UNITS:
+            sys.exit(f"unknown workload {w}; choose from {', '.join(WL_UNITS)}")
+    ctx = {"all": cpus(), "primary": primary_threads(), "z5": z5, "z5c": z5c, "wl": (a.workload, lib)}
+    say(f"Workload {a.workload} ({WL_UNITS[a.workload][1]}/s); Zen 5 core: cpu{z5}; Zen 5c core: cpu{z5c}; {len(ctx['all'])} threads; "
         f"{'AC' if on_ac() else 'battery'}; start temp {tctl():.0f} C; results -> {outdir}")
     run = {"co": phase_co, "curve": phase_curve, "limits": phase_limits, "race": phase_race,
-           "epp": phase_epp, "soak": phase_soak}
+           "epp": phase_epp, "soak": phase_soak, "stability": phase_stability}
     todo = ["co", "curve", "limits", "race"] if a.phase == "all" else [a.phase]
     start = time.time()
     for name in todo:

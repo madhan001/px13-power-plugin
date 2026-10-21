@@ -63,12 +63,15 @@ PROTECTED_PROCS="kwin_wayland Xwayland plasmashell systemd systemd-logind"
 # eco is the fanless battery mode: 12 W sustained sits on the measured
 # energy-per-task optimum (8-20 W) and settled near 58 C after 7 min with the
 # fans held off; 25 W fast lasts ~4 s through the EC, enough for page loads.
+# normal: 20 W sustained, the fans-allowed mode for heavy work on battery: vs
+# 12 W it is 47-85% faster on integer/FMA/DGEMM/AES work for the same or less
+# energy per task (the laptop's ~4 W baseline is spread over less time).
 # perf: 62 W sustained is the measured sweet spot with perf's fan curve
 # (warm chassis, 4 min: 34.7 GB/s SHA / 723 GFLOP/s FMA, within 1% of 70 W or
 # better, 2-7 C cooler); 85 W fast for bursts. Battery clamps to 56/62/85.
 declare -A MODES=(
   [eco]="power-saver 12000 12000 25000"
-  [normal]="balanced 25000 25000 35000"
+  [normal]="balanced 20000 20000 35000"
   [perf]="performance 62000 62000 85000"
 )
 # EPP per mode, enforced in every mode: the clamp fix restores the EPP it
@@ -107,8 +110,8 @@ usage() {
 Usage: px13 {eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
 
   eco       fanless: power-saver, 12W/12W/25W, EPP balance_power, fans off below
-            70 C, CO -25, NVIDIA PCI runtime auto
-  normal    balanced, 25W/25W/35W, CO -25, NVIDIA PCI runtime auto
+            70 C, Zen 5 cores capped at 4.3 GHz, CO -25, NVIDIA PCI runtime auto
+  normal    balanced, 20W/20W/35W, CO -25, NVIDIA PCI runtime auto
   perf      performance, 62W/62W/85W (56/62/85 on battery), EPP performance,
             fans up to 100% at 82 C, CO -25
   cycle     eco -> normal -> perf -> eco
@@ -343,6 +346,7 @@ publish_state() {
     printf 'epp=%s\n' "$(current_epp)"
     printf 'cpu_policy=%s\n' "$(cpu_policy)"
     printf 'fanless=%s\n' "$(fanless_curve_active && echo yes || echo no)"
+    printf 'max_mhz=%s\n' "$(current_freq_cap)"
     printf 'fan_curve=%s\n' "$(fanless_curve_active && echo eco || { fan_curve_active "${PERF_CURVE}" && echo perf || echo stock; })"
     printf 'applied=%s\n' "${applied}"
     printf 'limit_path=%s\n' "$(ec_available && echo ec || echo ryzenadj)"
@@ -472,6 +476,41 @@ fan_curve_hwmon() {
     [[ "${n}" == asus_custom_fan_curve ]] && { printf '%s\n' "${h}"; return 0; }
   done
   return 1
+}
+
+# Clock cap per mode (kHz; empty = the hardware maximum). eco caps the Zen 5
+# cores at 4.3 GHz: on one core it cut energy per task 26-36% across integer,
+# FMA, DGEMM and AES work for at most 19% more time, and short bursts never
+# reach it under EPP balance_power. Zen 5c cores top out at 3.29 GHz anyway.
+mode_freq_cap() {
+  case "$1" in
+    eco) echo 4300000 ;;
+  esac
+}
+
+# Sets every CPU's scaling_max_freq to the mode's cap (or its own hardware
+# maximum); re-run after the clamp fix, which resets it.
+apply_mode_freqcap() {
+  local cap pol hw want cur changed=0
+  cap="$(mode_freq_cap "$1")"
+  for pol in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+    read -r hw 2>/dev/null < "${pol}/amd_pstate_max_freq" || continue
+    want="${hw}"
+    [[ -n "${cap}" ]] && ((cap < hw)) && want="${cap}"
+    read -r cur 2>/dev/null < "${pol}/scaling_max_freq" || continue
+    ((cur - want > 50000 || want - cur > 50000)) || continue
+    printf '%s\n' "${want}" > "${pol}/scaling_max_freq" 2>/dev/null || true
+    changed=1
+  done
+  if ((changed)); then
+    log "Clock cap for $1: ${cap:-none}${cap:+ kHz}."
+  fi
+}
+
+current_freq_cap() {
+  local cur
+  read -r cur 2>/dev/null < /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq || cur=0
+  printf '%s\n' "$((cur / 1000))"
 }
 
 mode_fan_curve() {
@@ -622,6 +661,7 @@ apply_mode() {
     done
     pstate_unclamp
   fi
+  apply_mode_freqcap "$1"
   return "${rc}"
 }
 
@@ -824,6 +864,7 @@ check() {
       sleep 1.5
       apply_mode_limits "${mode}" || true
     fi
+    apply_mode_freqcap "${mode}"
   fi
   cpu_auto_apply
   optimized_apply

@@ -542,6 +542,31 @@ PlasmoidItem {
                         wrapMode: Text.Wrap
                     }
 
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: Kirigami.Units.smallSpacing
+                        visible: root.px.sdcard !== undefined
+
+                        PlasmaComponents3.Label {
+                            Layout.fillWidth: true
+                            text: "SD card reader"
+                        }
+                        PlasmaComponents3.Switch {
+                            checked: root.px.sdcard === "on"
+                            enabled: !root.commandBusy
+                            onToggled: root.runAction(checked ? "sdcard-on" : "sdcard-off")
+                        }
+                    }
+
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        visible: root.px.sdcard !== undefined
+                        text: "Off on battery (saves about 0.26 W); back on with AC."
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        wrapMode: Text.Wrap
+                    }
+
                     PlasmaComponents3.Button {
                         visible: root.normalLimit > 0 && root.normalLimit < 100
                         enabled: !root.commandBusy

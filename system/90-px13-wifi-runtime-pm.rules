@@ -1,0 +1,3 @@
+# Qualcomm WCN785x (FastConnect 7800) Wi-Fi: let the PCIe function runtime
+# suspend (ath12k leaves power/control at "on").
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x17cb", ATTR{device}=="0x1107", ATTR{power/control}="auto"

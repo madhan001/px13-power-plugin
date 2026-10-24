@@ -4,8 +4,11 @@ set -euo pipefail
 case "${1:-}" in
   eco|normal|perf|cycle|reapply|deep-eco|deep-eco-close|hybrid|optimized|gpu-users)
     ;;
+  sdcard-on|sdcard-off)
+    PX13_NO_NOTIFY=1 exec /usr/local/bin/px13 sdcard "${1#sdcard-}"
+    ;;
   *)
-    echo "Usage: px13-panel-run {eco|normal|perf|cycle|reapply|deep-eco|deep-eco-close|hybrid|optimized|gpu-users}" >&2
+    echo "Usage: px13-panel-run {eco|normal|perf|cycle|reapply|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|sdcard-on|sdcard-off}" >&2
     exit 2
     ;;
 esac

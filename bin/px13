@@ -99,6 +99,14 @@ mode_epp() {
 FANLESS_CURVE="30c:0%,45c:0%,55c:0%,65c:0%,70c:0%,75c:25%,80c:50%,85c:100%"
 PERF_CURVE="49c:1%,52c:6%,55c:12%,58c:26%,61c:34%,67c:60%,75c:85%,82c:100%"
 
+# The Genesys GL9755 SD card reader never runtime-suspends; removing it from
+# the PCI bus saved 0.26 W at idle (A/B, 2026-10-24). It is off on battery and
+# on with AC; "px13 sdcard on|off" overrides that until the next plug/unplug.
+SD_VENDOR=0x17a0
+SD_DEVICE=0x9755
+SD_BRIDGE_FILE="${STATE_DIR}/sdcard_bridge"
+SD_AUTO_AC_FILE="${RUN_DIR}/sdcard_auto_ac"
+
 # CPU mode follows the power source: perf on AC, eco on battery. A manual
 # choice holds until the next plug/unplug. "px13 auto off" disables it.
 CPU_POLICY_FILE="${STATE_DIR}/cpu_policy"
@@ -107,7 +115,7 @@ CPU_AUTO_AC_FILE="${RUN_DIR}/cpu_auto_ac"
 
 usage() {
   cat <<'EOF'
-Usage: px13 {eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
+Usage: px13 {eco|normal|perf|cycle|auto|sdcard|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state}
 
   eco       fanless: power-saver, 12W/12W/25W, EPP balance_power, fans off below
             70 C, Zen 5 cores capped at 4.3 GHz, CO -25, NVIDIA PCI runtime auto
@@ -119,6 +127,8 @@ Usage: px13 {eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|op
   auto [on|off]
             CPU mode follows power (default on): perf on AC, eco on battery;
             a manual mode choice holds until the next plug/unplug
+  sdcard on|off
+            SD card reader on or off (off on battery, on with AC by default)
   status    full report: mode, live limits, battery, GPU, RyzenAdj
   deep-eco  firmware GPU Eco on: NVIDIA GPU powered off, live (no reboot)
   deep-eco-close
@@ -347,6 +357,7 @@ publish_state() {
     printf 'cpu_policy=%s\n' "$(cpu_policy)"
     printf 'fanless=%s\n' "$(fanless_curve_active && echo yes || echo no)"
     printf 'max_mhz=%s\n' "$(current_freq_cap)"
+    printf 'sdcard=%s\n' "$(sdcard_state)"
     printf 'fan_curve=%s\n' "$(fanless_curve_active && echo eco || { fan_curve_active "${PERF_CURVE}" && echo perf || echo stock; })"
     printf 'applied=%s\n' "${applied}"
     printf 'limit_path=%s\n' "$(ec_available && echo ec || echo ryzenadj)"
@@ -594,6 +605,63 @@ apply_mode_epp() {
     printf '%s\n' "${want}" > "${f}" 2>/dev/null || true
   done
   log "EPP set to ${want} for $1."
+}
+
+sdcard_dev() {
+  local dev
+  for dev in /sys/bus/pci/devices/*; do
+    [[ "$(cat "${dev}/vendor" 2>/dev/null)" == "${SD_VENDOR}" &&
+       "$(cat "${dev}/device" 2>/dev/null)" == "${SD_DEVICE}" ]] && { printf '%s\n' "${dev}"; return 0; }
+  done
+  return 1
+}
+
+sdcard_state() {
+  sdcard_dev >/dev/null && echo on || echo off
+}
+
+# sdcard_set on|off: remove the reader from the PCI bus, or rescan its bridge.
+sdcard_set() {
+  local dev bridge=""
+  if [[ "$1" == off ]]; then
+    dev="$(sdcard_dev)" || return 0
+    install -d -m 755 "${STATE_DIR}"
+    basename "$(dirname "$(readlink -f "${dev}")")" > "${SD_BRIDGE_FILE}"
+    printf '1\n' > "${dev}/remove"
+    log "SD card reader off."
+  else
+    sdcard_dev >/dev/null && return 0
+    read -r bridge 2>/dev/null < "${SD_BRIDGE_FILE}" || true
+    if [[ -n "${bridge}" && -e "/sys/bus/pci/devices/${bridge}/rescan" ]]; then
+      printf '1\n' > "/sys/bus/pci/devices/${bridge}/rescan"
+    else
+      printf '1\n' > /sys/bus/pci/rescan
+    fi
+    log "SD card reader on."
+  fi
+}
+
+# Once per power-source change: reader off on battery, on with AC.
+sdcard_auto_apply() {
+  local ac=0 last=""
+  on_ac && ac=1
+  read -r last 2>/dev/null < "${SD_AUTO_AC_FILE}" || true
+  [[ "${last}" != "${ac}" ]] || return 0
+  install -d -m 755 "${RUN_DIR}"
+  printf '%s\n' "${ac}" > "${SD_AUTO_AC_FILE}"
+  if ((ac)); then sdcard_set on; else sdcard_set off; fi
+}
+
+sdcard_cmd() {
+  case "${1:-}" in
+    on|off)
+      with_lock
+      sdcard_set "$1"
+      publish_state
+      echo "SD card reader $1 (until the next plug/unplug)."
+      ;;
+    *) echo "Usage: px13 sdcard on|off" >&2; return 1 ;;
+  esac
 }
 
 cpu_policy() {
@@ -867,6 +935,7 @@ check() {
     apply_mode_freqcap "${mode}"
   fi
   cpu_auto_apply
+  sdcard_auto_apply
   optimized_apply
   publish_state
   exec 9>&-
@@ -1356,7 +1425,7 @@ status() {
 
 cmd="${1:-}"
 case "${cmd}" in
-  eco|normal|perf|cycle|auto|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state) ;;
+  eco|normal|perf|cycle|auto|sdcard|status|deep-eco|deep-eco-close|hybrid|optimized|gpu-users|reapply|check|watch|state) ;;
   *) usage; exit 1 ;;
 esac
 
@@ -1388,6 +1457,7 @@ case "${cmd}" in
   eco|normal|perf) set_mode "${cmd}" ;;
   cycle) cycle ;;
   auto) auto_cmd "${2:-on}" ;;
+  sdcard) sdcard_cmd "${2:-}" ;;
   status) status ;;
   deep-eco) deep_eco ;;
   deep-eco-close) deep_eco close ;;

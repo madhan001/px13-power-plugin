@@ -16,10 +16,12 @@ sudo install -o root -g root -m 440 system/sudoers-px13-power /etc/sudoers.d/px1
 sudo install -o root -g root -m 644 system/px13-watch.service system/px13-reapply.service /etc/systemd/system/
 sudo install -o root -g root -m 755 system/px13-sleep /usr/lib/systemd/system-sleep/px13
 sudo install -o root -g root -m 644 system/asus-nb-wmi-px13.conf /etc/modprobe.d/
+sudo install -o root -g root -m 644 system/90-px13-wifi-runtime-pm.rules /etc/udev/rules.d/
 # px13-watch now tracks AC changes itself; remove the old udev trigger.
 sudo rm -f /etc/udev/rules.d/90-px13-ac.rules
 sudo systemctl daemon-reload
 sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=pci --attr-match=vendor=0x17cb --action=bind
 sudo systemctl reenable px13-watch.service
 sudo systemctl restart px13-watch.service
 

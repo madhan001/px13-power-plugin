@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Turn the ASUS DialPad driver (and its UI) on or off for this user. Off is
+# persistent across reboots: the driver costs ~0.5 W of CPU package power at
+# idle (A/B, 2026-10-24).
+set -euo pipefail
+
+units=("asus_dialpad_driver@$(id -un).service" "asus_dialpad_driver_ui@$(id -un).service")
+case "${1:-}" in
+  on) systemctl --user enable --now "${units[@]}" >/dev/null 2>&1; echo "DialPad on." ;;
+  off) systemctl --user disable --now "${units[@]}" >/dev/null 2>&1; echo "DialPad off (stays off after reboot)." ;;
+  *) echo "Usage: px13-panel-dialpad on|off" >&2; exit 2 ;;
+esac

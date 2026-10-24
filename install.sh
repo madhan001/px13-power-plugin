@@ -27,7 +27,7 @@ sudo systemctl restart px13-watch.service
 
 echo "==> User files"
 install -d "${USER_BIN}" "${PLASMOID_DIR}"
-install -m 755 bin/px13-panel-run bin/px13-panel-battery bin/px13-panel-status bin/px13-open-status bin/px13-cycle "${USER_BIN}/"
+install -m 755 bin/px13-panel-run bin/px13-panel-battery bin/px13-panel-status bin/px13-panel-dialpad bin/px13-open-status bin/px13-cycle "${USER_BIN}/"
 cp -r plasmoid/. "${PLASMOID_DIR}/"
 
 echo "==> Done. Restart plasmashell to load the widget changes:"

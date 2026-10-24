@@ -29,6 +29,7 @@ awk '{ printf "battery_watts=%.1f\n", $1 / 1000000 }' "${BAT}/power_now" 2>/dev/
 echo "charge_limit=$(cat "${BAT}/charge_control_end_threshold" 2>/dev/null || echo '')"
 # asusd's normal limit; differs from the live one during a one-shot full charge.
 echo "charge_limit_base=$(sed -n 's/^ *base_charge_control_end_threshold: *\([0-9]*\).*/\1/p' /etc/asusd/asusd.ron 2>/dev/null)"
+echo "dialpad=$(systemctl --user is-active "asus_dialpad_driver@$(id -un).service" 2>/dev/null)"
 echo "ac_online=$(cat /sys/class/power_supply/AC0/online 2>/dev/null || echo '')"
 # dGPU runtime power state (active / suspended), readable without root.
 gpu_rt=""

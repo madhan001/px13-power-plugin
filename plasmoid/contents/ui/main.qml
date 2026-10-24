@@ -558,10 +558,27 @@ PlasmoidItem {
                         }
                     }
 
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: root.px.dialpad !== undefined
+
+                        PlasmaComponents3.Label {
+                            Layout.fillWidth: true
+                            text: "DialPad"
+                        }
+                        PlasmaComponents3.Switch {
+                            checked: root.px.dialpad === "active"
+                            enabled: !root.commandBusy
+                            onToggled: root.runCommand(root.binDir + "px13-panel-dialpad " + (checked ? "on" : "off"),
+                                                       checked ? "Starting DialPad" : "Stopping DialPad")
+                        }
+                    }
+
                     PlasmaComponents3.Label {
                         Layout.fillWidth: true
                         visible: root.px.sdcard !== undefined
-                        text: "Off on battery (saves about 0.26 W); back on with AC."
+                        text: "SD reader is off on battery (saves about 0.26 W) and back on with AC. "
+                              + "DialPad off saves about 0.5 W and stays off after reboot."
                         font: Kirigami.Theme.smallFont
                         opacity: 0.7
                         wrapMode: Text.Wrap

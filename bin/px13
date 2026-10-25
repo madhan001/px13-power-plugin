@@ -121,7 +121,7 @@ Usage: px13 {eco|normal|perf|cycle|auto|sdcard|status|deep-eco|deep-eco-close|hy
             70 C, Zen 5 cores capped at 4.3 GHz, CO -25, NVIDIA PCI runtime auto
   normal    balanced, 20W/20W/35W, CO -25, NVIDIA PCI runtime auto
   perf      performance, 62W/62W/85W (56/62/85 on battery), EPP performance,
-            fans up to 100% at 82 C, CO -25
+            fans up to 100% at 82 C, dGPU +20 W extra TGP on AC (85 W), CO -25
   cycle     eco -> normal -> perf -> eco
             (changing the power profile elsewhere, e.g. KDE or Fn+F5, switches mode too)
   auto [on|off]
@@ -358,6 +358,7 @@ publish_state() {
     printf 'fanless=%s\n' "$(fanless_curve_active && echo yes || echo no)"
     printf 'max_mhz=%s\n' "$(current_freq_cap)"
     printf 'sdcard=%s\n' "$(sdcard_state)"
+    printf 'gpu_extra_tgp=%s\n' "$( [[ -n "$(nvidia_devices)" ]] && nv_extra_tgp 2>/dev/null || true)"
     printf 'fan_curve=%s\n' "$(fanless_curve_active && echo eco || { fan_curve_active "${PERF_CURVE}" && echo perf || echo stock; })"
     printf 'applied=%s\n' "${applied}"
     printf 'limit_path=%s\n' "$(ec_available && echo ec || echo ryzenadj)"
@@ -487,6 +488,44 @@ fan_curve_hwmon() {
     [[ "${n}" == asus_custom_fan_curve ]] && { printf '%s\n' "${h}"; return 0; }
   done
   return 1
+}
+
+# dGPU power (Hybrid only). nvidia-powerd hands the GPU ASUS's extra TGP and
+# Dynamic Boost; without it the driver enforces the 55 W base. It fails at
+# boot while GPU Eco has the GPU off and px13 stops it for GPU Eco, so px13
+# starts it whenever the GPU is up. Extra TGP (WMI) is +10 W stock (75 W with
+# Dynamic Boost on AC); perf on AC sets +20 W (85 W): in a 7-min FP16 soak
+# the 4050 held a 2,640 MHz clock ceiling at 86 W, +5.6% over 75 W, so more
+# TGP only adds heat (2026-10-24).
+WMI_NV_EXTRA_TGP=0x00120098
+NV_EXTRA_TGP_STOCK=10
+NV_EXTRA_TGP_PERF=20
+
+nv_extra_tgp_want() {
+  if [[ "$1" == perf ]] && on_ac; then echo "${NV_EXTRA_TGP_PERF}"; else echo "${NV_EXTRA_TGP_STOCK}"; fi
+}
+
+nv_extra_tgp() {
+  local raw
+  raw="$(wmi_dsts "${WMI_NV_EXTRA_TGP}" 2>/dev/null)" || return 1
+  [[ "${raw}" == 0x* ]] || return 1
+  echo "$((raw & 0xffff))"
+}
+
+# With the GPU on the bus: keep nvidia-powerd running and the mode's extra TGP.
+apply_mode_gpu_power() {
+  local want cur
+  [[ -n "$(nvidia_devices)" && "$(gpu_driver)" == nvidia ]] || return 0
+  if ! systemctl is-active --quiet nvidia-powerd.service; then
+    systemctl start nvidia-powerd.service >/dev/null 2>&1 && log "Started nvidia-powerd (Dynamic Boost)."
+  fi
+  ec_available || return 0
+  want="$(nv_extra_tgp_want "$1")"
+  cur="$(nv_extra_tgp || true)"
+  [[ "${cur}" == "${want}" ]] && return 0
+  if [[ "$(wmi_devs "${WMI_NV_EXTRA_TGP}" "${want}")" == 0x1 ]]; then
+    log "dGPU extra TGP +${want} W for $1."
+  fi
 }
 
 # Clock cap per mode (kHz; empty = the hardware maximum). eco caps the Zen 5
@@ -730,6 +769,7 @@ apply_mode() {
     pstate_unclamp
   fi
   apply_mode_freqcap "$1"
+  apply_mode_gpu_power "$1"
   return "${rc}"
 }
 
@@ -933,6 +973,7 @@ check() {
       apply_mode_limits "${mode}" || true
     fi
     apply_mode_freqcap "${mode}"
+    apply_mode_gpu_power "${mode}"
   fi
   cpu_auto_apply
   sdcard_auto_apply
@@ -1369,6 +1410,7 @@ hybrid() {
     udevadm control --reload
   fi
   gpu_eco_off || rc=$?
+  ((rc == 0)) && apply_mode_gpu_power "$(stored_mode)"
   publish_state
   if [[ "${rc}" -eq 0 ]]; then
     case "$(gpu_driver_issue)" in

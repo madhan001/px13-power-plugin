@@ -151,3 +151,9 @@ system/                  systemd units, sleep hook, sudoers, modprobe, udev
                          kernel RFC: asus-wmi support for the Vivo/ProArt dGPU
                          disable device (0x00090120), the GPU Eco switch
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE). The exception is
+`0001-platform-x86-asus-wmi-dgpu-vivo.patch`, which modifies the Linux kernel
+and is therefore GPL-2.0, like the kernel itself.

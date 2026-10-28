@@ -509,6 +509,17 @@ PlasmoidItem {
                         elide: Text.ElideRight
                     }
 
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        visible: (root.px.battery_health || "").length > 0
+                        text: "Health " + root.px.battery_health + "% · " + root.px.battery_full_wh
+                              + " of " + root.px.battery_design_wh + " Wh"
+                              + (root.px.battery_cycles ? " · " + root.px.battery_cycles + " cycles" : "")
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        elide: Text.ElideRight
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: Kirigami.Units.smallSpacing

@@ -26,6 +26,11 @@ fi
 echo "battery_percent=$(cat "${BAT}/capacity" 2>/dev/null || echo '')"
 echo "battery_status=$(cat "${BAT}/status" 2>/dev/null || echo '')"
 awk '{ printf "battery_watts=%.1f\n", $1 / 1000000 }' "${BAT}/power_now" 2>/dev/null || echo "battery_watts="
+# Battery health: full capacity now vs design (Wh); cycles only if reported.
+awk -v f="$(cat "${BAT}/energy_full" 2>/dev/null)" -v d="$(cat "${BAT}/energy_full_design" 2>/dev/null)" \
+  'BEGIN { if (f > 0 && d > 0) printf "battery_health=%.0f\nbattery_full_wh=%.1f\nbattery_design_wh=%.1f\n", 100 * f / d, f / 1e6, d / 1e6 }'
+cycles="$(cat "${BAT}/cycle_count" 2>/dev/null || echo 0)"
+[[ "${cycles}" =~ ^[0-9]+$ ]] && ((cycles > 0)) && echo "battery_cycles=${cycles}"
 echo "charge_limit=$(cat "${BAT}/charge_control_end_threshold" 2>/dev/null || echo '')"
 # asusd's normal limit; differs from the live one during a one-shot full charge.
 echo "charge_limit_base=$(sed -n 's/^ *base_charge_control_end_threshold: *\([0-9]*\).*/\1/p' /etc/asusd/asusd.ron 2>/dev/null)"
